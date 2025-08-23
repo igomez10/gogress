@@ -14,7 +14,7 @@ type Table struct {
 	Storage    ReadWriteCloserSeeker
 }
 
-const paddingSize = 16
+const paddingSize = 32
 
 func (tb *Table) Put(key, val []byte, writeToLogHook func(int64)) error {
 	// Create a new record

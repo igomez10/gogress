@@ -2,6 +2,7 @@ package db
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -50,7 +51,8 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 	// load index from file
 	// TODO add list of storage files
-	m, err := BuildIndex(db.LogFile, map[string]ReadWriteCloserSeeker{})
+	storageFiles := map[string]io.ReadSeeker{}
+	m, err := BuildIndex(db.LogFile, storageFiles)
 	for tableName, idx := range m {
 		db.Tables[tableName].KeyOffsets = idx
 	}
@@ -65,7 +67,7 @@ var InvalidLogLineError = errors.New("invalid log line")
 
 // format is tableName:key:value
 // For crash recovery we scan the storage and apply the log
-func BuildIndex(walFile io.Reader, storageFiles map[string]ReadWriteCloserSeeker) (map[string]map[string]int64, error) {
+func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadSeeker) (map[string]map[string]int64, error) {
 	finalIndex := map[string]map[string]int64{}
 	// Scan storage files
 	indexFromStorage := map[string]map[string]int64{}
@@ -100,11 +102,37 @@ func BuildIndex(walFile io.Reader, storageFiles map[string]ReadWriteCloserSeeker
 	return finalIndex, nil
 }
 
-func BuildIndexFromStorage(storage ReadWriteCloserSeeker) (map[string]int64, error) {
-	return nil, nil
+func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
+	idx := map[string]int64{}
+	currentOffset := 0
+	for {
+		content := make([]byte, paddingSize)
+		readBytes, err := storage.Read(content)
+		if err != nil {
+			switch err {
+			case io.EOF:
+				// End of file reached
+				return idx, nil
+			default:
+				return nil, err
+			}
+		}
+		if readBytes != paddingSize {
+			return nil, InvalidLogLineError
+		}
+		// split on :
+		splitted := bytes.Split(content, []byte(":"))
+		// process current
+		if len(splitted) != 2 {
+			return nil, InvalidLogLineError
+		}
+		key := splitted[0]
+		idx[string(key)] = int64(currentOffset)
+		currentOffset += paddingSize
+	}
 }
 
-func BuildIndexFromWAL(walFile io.Reader, storageFiles map[string]ReadWriteCloserSeeker) (map[string]map[string]int64, error) {
+func BuildIndexFromWAL(walFile io.Reader, storageFiles map[string]io.ReadSeeker) (map[string]map[string]int64, error) {
 	idx := map[string]map[string]int64{}
 	scanner := bufio.NewScanner(walFile)
 
