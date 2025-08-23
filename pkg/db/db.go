@@ -82,7 +82,8 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 	}
 
 	if db.Storage == nil {
-		f, err := os.Create("/tmp/gogressdb")
+		// create but not truncate
+		f, err := os.OpenFile("/tmp/gogressdb", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +168,7 @@ func (db *DB) Put(key, val []byte) error {
 
 	// write to log for crash recovery
 	if db.LogFile != nil {
-		fmt.Fprintln(db.LogFile, string(rec))
+		fmt.Fprintln(db.LogFile, string(key)+":"+fmt.Sprintf("%d", off))
 	}
 
 	// write record to file

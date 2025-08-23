@@ -10,7 +10,15 @@ import (
 )
 
 func main() {
-	localDB, err := db.NewDB(db.NewDBOptions{})
+	logFile, err := os.OpenFile("/tmp/gogress.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		// ignore
+	}
+	defer logFile.Close()
+
+	localDB, err := db.NewDB(db.NewDBOptions{
+		LogFile: logFile,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error loading db: %v\n", err)
 		os.Exit(1)
@@ -51,7 +59,7 @@ func main() {
 				Description: "store a value by key",
 				ArgsUsage:   "[key] [value]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					fmt.Printf("put command %+v", cmd.Args().Slice())
+					localDB.Put([]byte(cmd.Args().Slice()[0]), []byte(cmd.Args().Slice()[1]))
 					return nil
 				},
 			},
