@@ -2,7 +2,6 @@ package db
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -12,66 +11,17 @@ import (
 	"sync"
 )
 
-// import
-type ReadWriteCloserSeeker interface {
-	io.Reader
-	io.Writer
-	io.Closer
-	io.Seeker
-	Sync() error
-	Name() string
-}
-
-type MockReadWriteCloserSeeker struct {
-	data   []byte
-	offset int64
-}
-
-func (m *MockReadWriteCloserSeeker) Read(p []byte) (n int, err error) {
-	if m.offset >= int64(len(m.data)) {
-		return 0, io.EOF
-	}
-	n = copy(p, m.data[m.offset:])
-	m.offset += int64(n)
-	return n, nil
-}
-
-func (m *MockReadWriteCloserSeeker) Write(p []byte) (n int, err error) {
-	m.data = append(m.data[:m.offset], p...)
-	m.offset += int64(len(p))
-	return len(p), nil
-}
-
-func (m *MockReadWriteCloserSeeker) Close() error {
-	return nil
-}
-
-func (m *MockReadWriteCloserSeeker) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-		m.offset = offset
-	case io.SeekCurrent:
-		m.offset += offset
-	case io.SeekEnd:
-		m.offset = int64(len(m.data)) + offset
-	}
-	if m.offset < 0 {
-		return 0, io.EOF
-	}
-	return m.offset, nil
-}
-
-func (m *MockReadWriteCloserSeeker) Sync() error {
-	return nil
-}
-
-func (m *MockReadWriteCloserSeeker) Name() string {
-	return "mock"
-}
-
 type NewDBOptions struct {
 	File    ReadWriteCloserSeeker
 	LogFile io.ReadWriter
+}
+
+func initializeStorage(storageName string) (ReadWriteCloserSeeker, error) {
+	f, err := os.OpenFile("/tmp/gogressdb_"+storageName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 func NewDB(opts NewDBOptions) (*DB, error) {
@@ -87,7 +37,7 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 	if db.Tables["default"].Storage == nil {
 		// create but not truncate
-		f, err := os.OpenFile("/tmp/gogressdb_default", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		f, err := initializeStorage("default")
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +49,8 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 	}
 
 	// load index from file
-	m, err := LoadOffsetsFromFile(db.LogFile)
+	// TODO add list of storage files
+	m, err := BuildIndex(db.LogFile, map[string]ReadWriteCloserSeeker{})
 	for tableName, idx := range m {
 		db.Tables[tableName].KeyOffsets = idx
 	}
@@ -112,10 +63,51 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 var InvalidLogLineError = errors.New("invalid log line")
 
-// format is tableName key value
-func LoadOffsetsFromFile(reader io.Reader) (map[string]map[string]int64, error) {
+// format is tableName:key:value
+// For crash recovery we scan the storage and apply the log
+func BuildIndex(walFile io.Reader, storageFiles map[string]ReadWriteCloserSeeker) (map[string]map[string]int64, error) {
+	finalIndex := map[string]map[string]int64{}
+	// Scan storage files
+	indexFromStorage := map[string]map[string]int64{}
+	for tableName, storage := range storageFiles {
+		storageTableIdx, err := BuildIndexFromStorage(storage)
+		if err != nil {
+			return nil, err
+		}
+
+		indexFromStorage[tableName] = storageTableIdx
+	}
+
+	// Scan WAL
+	indexFromWal, err := BuildIndexFromWAL(walFile, storageFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	for tableName := range indexFromStorage {
+		finalIndex[tableName] = indexFromStorage[tableName]
+	}
+
+	for tableName := range indexFromWal {
+		for k, v := range indexFromWal[tableName] {
+			if finalIndex[tableName] == nil {
+				finalIndex[tableName] = map[string]int64{}
+			}
+			finalIndex[tableName][k] = v
+		}
+	}
+
+	return finalIndex, nil
+}
+
+func BuildIndexFromStorage(storage ReadWriteCloserSeeker) (map[string]int64, error) {
+	return nil, nil
+}
+
+func BuildIndexFromWAL(walFile io.Reader, storageFiles map[string]ReadWriteCloserSeeker) (map[string]map[string]int64, error) {
 	idx := map[string]map[string]int64{}
-	scanner := bufio.NewScanner(reader)
+	scanner := bufio.NewScanner(walFile)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.SplitN(line, ":", 3)
@@ -192,81 +184,33 @@ func (db *DB) Get(tableName, key []byte) ([]byte, bool, error) {
 	return table.Get(key)
 }
 
-type Table struct {
-	KeyOffsets map[string]int64
-	Mutex      sync.RWMutex
-	Storage    ReadWriteCloserSeeker
+type CreateTableOptions struct {
+	Storage ReadWriteCloserSeeker
 }
 
-const paddingSize = 16
+var CreateTableAlreadyExistsError = errors.New("table already exists")
 
-func (tb *Table) Put(key, val []byte, writeToLogHook func(int64)) error {
-	// Create a new record
-	if len(key)+len(val)+1 > paddingSize {
-		return fmt.Errorf("record too large")
-	}
-	rec := make([]byte, 0, paddingSize)
-	rec = append(rec, key...)
-	rec = append(rec, []byte(":")...)
-	rec = append(rec, val...)
+func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
 
-	// fill remaining space with null bytes
-	for i := len(key) + len(val) + 1; i < paddingSize; i++ {
-		rec = append(rec, 0)
+	if _, ok := db.Tables[tableName]; ok {
+		return CreateTableAlreadyExistsError
 	}
 
-	tb.Mutex.Lock()
-	defer tb.Mutex.Unlock()
-	off, err := tb.Storage.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
+	db.Tables[tableName] = &Table{
+		KeyOffsets: make(map[string]int64),
 	}
 
-	// TODO move to db
-	writeToLogHook(off)
-
-	// write record to file
-	sizewritten, err := tb.Storage.Write(rec)
-	if err != nil {
-		return err
-	}
-	if sizewritten != len(rec) {
-		return io.ErrShortWrite
+	if opts.Storage != nil {
+		db.Tables[tableName].Storage = opts.Storage
+	} else {
+		f, err := initializeStorage(tableName)
+		if err != nil {
+			return err
+		}
+		db.Tables[tableName].Storage = f
 	}
 
-	// flush on every write
-	if err := tb.Storage.Sync(); err != nil {
-		return err
-	}
-
-	// update offset for key
-	tb.KeyOffsets[string(key)] = off
 	return nil
-}
-
-func (tb *Table) Get(key []byte) ([]byte, bool, error) {
-	tb.Mutex.RLock()
-	off, ok := tb.KeyOffsets[string(key)]
-	tb.Mutex.RUnlock()
-	if !ok {
-		return nil, false, nil
-	}
-
-	if _, err := tb.Storage.Seek(off, io.SeekStart); err != nil {
-		return nil, false, err
-	}
-
-	reader := io.LimitReader(tb.Storage, paddingSize)
-	buf := make([]byte, paddingSize)
-	if _, err := io.ReadFull(reader, buf); err != nil {
-		return nil, false, err
-	}
-	// trim null bytes
-	buf = bytes.TrimRight(buf, "\x00")
-	// split by first colon
-	parts := bytes.SplitN(buf, []byte(":"), 2)
-	if len(parts) != 2 {
-		return nil, false, fmt.Errorf("invalid record format")
-	}
-	return parts[1], true, nil
 }

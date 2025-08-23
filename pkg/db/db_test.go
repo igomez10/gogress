@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -62,7 +63,7 @@ func Test_loadOperationsFromLogFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			offsets, err := LoadOffsetsFromFile(tt.args.reader)
+			offsets, err := BuildIndex(tt.args.reader, map[string]ReadWriteCloserSeeker{})
 			if (err != nil && !errors.Is(err, tt.expectedErr)) || (err == nil && tt.expectedErr != nil) {
 				t.Errorf("loadOperationsFromLogFile() error = %v, want %v", err, tt.expectedErr)
 			}
@@ -75,6 +76,56 @@ func Test_loadOperationsFromLogFile(t *testing.T) {
 				}
 			}
 
+		})
+	}
+}
+
+func TestDB_CreateTable(t *testing.T) {
+	type fields struct {
+		LogFile io.ReadWriter
+		Mutex   sync.RWMutex
+		Tables  map[string]*Table
+	}
+	type args struct {
+		tableName string
+	}
+	tests := []struct {
+		name        string
+		fields      fields
+		args        args
+		expectedErr error
+	}{
+		{
+			name: "create new table",
+			fields: fields{
+				LogFile: nil,
+				Mutex:   sync.RWMutex{},
+				Tables:  make(map[string]*Table),
+			},
+			args:        args{tableName: "new_table"},
+			expectedErr: nil,
+		},
+		{
+			name: "create existing table",
+			fields: fields{
+				LogFile: nil,
+				Mutex:   sync.RWMutex{},
+				Tables:  map[string]*Table{"existing_table": {}},
+			},
+			args:        args{tableName: "existing_table"},
+			expectedErr: CreateTableAlreadyExistsError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &DB{
+				LogFile: tt.fields.LogFile,
+				Mutex:   tt.fields.Mutex,
+				Tables:  tt.fields.Tables,
+			}
+			if err := db.CreateTable(tt.args.tableName, &CreateTableOptions{}); err != tt.expectedErr {
+				t.Errorf("DB.CreateTable() error = %v, expectedErr %v", err, tt.expectedErr)
+			}
 		})
 	}
 }

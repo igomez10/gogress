@@ -89,7 +89,11 @@ func main() {
 				UsageText:   "create-table [name]",
 				Description: "create a new table",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					panic("unimplemented")
+					tableName := cmd.Args().Slice()[0]
+					if err := localDB.CreateTable(tableName, &db.CreateTableOptions{}); err != nil {
+						return err
+					}
+					return nil
 				},
 			},
 		},
