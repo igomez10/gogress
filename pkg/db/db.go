@@ -1,10 +1,14 @@
 package db
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -67,14 +71,14 @@ func (m *MockReadWriteCloserSeeker) Name() string {
 
 type NewDBOptions struct {
 	File    ReadWriteCloserSeeker
-	LogFile io.Writer
+	LogFile io.ReadWriter
 }
 
 func NewDB(opts NewDBOptions) (*DB, error) {
 	db := &DB{
-		Storage: opts.File,
-		LogFile: opts.LogFile,
-		Idx:     make(map[string]int64),
+		Storage:    opts.File,
+		LogFile:    opts.LogFile,
+		KeyOffsets: make(map[string]int64),
 	}
 
 	if db.Storage == nil {
@@ -89,14 +93,43 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 		db.LogFile = os.Stdout
 	}
 
+	// load index from file
+	m, err := LoadOffsetsFromFile(db.LogFile)
+	if err != nil {
+		return nil, err
+	}
+
+	db.KeyOffsets = m
+
 	return db, nil
+}
+
+var InvalidLogLineError = errors.New("invalid log line")
+
+func LoadOffsetsFromFile(reader io.Reader) (map[string]int64, error) {
+	idx := map[string]int64{}
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return nil, InvalidLogLineError
+		}
+		key := parts[0]
+		off, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return nil, InvalidLogLineError
+		}
+		idx[key] = off
+	}
+	return idx, nil
 }
 
 type DB struct {
 	Storage ReadWriteCloserSeeker
-	LogFile io.Writer
+	LogFile io.ReadWriter
 
-	// Idx is a mapping from keys to their file offsets
+	// KeyOffsets is a mapping from keys to their file offsets
 	// this allows for quick lookups when retrieving values
 	// and efficient deletion of records
 	// the key is the record's key, basically the primary key
@@ -104,8 +137,8 @@ type DB struct {
 	// the value is the record's value, which is the file offset
 	// of the last record for that key. by offset we mean the byte offset
 	// from the beginning of the file to the start of the record.
-	Idx map[string]int64 // key -> file offset of last record
-	Mu  sync.RWMutex
+	KeyOffsets map[string]int64 // key -> file offset of last record
+	Mutex      sync.RWMutex
 }
 
 const paddingSize = 64
@@ -125,8 +158,8 @@ func (db *DB) Put(key, val []byte) error {
 		rec = append(rec, 0)
 	}
 
-	db.Mu.Lock()
-	defer db.Mu.Unlock()
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
 	off, err := db.Storage.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
@@ -152,14 +185,14 @@ func (db *DB) Put(key, val []byte) error {
 	}
 
 	// update offset for key
-	db.Idx[string(key)] = off
+	db.KeyOffsets[string(key)] = off
 	return nil
 }
 
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
-	db.Mu.RLock()
-	off, ok := db.Idx[string(key)]
-	db.Mu.RUnlock()
+	db.Mutex.RLock()
+	off, ok := db.KeyOffsets[string(key)]
+	db.Mutex.RUnlock()
 	if !ok {
 		return nil, false, nil
 	}

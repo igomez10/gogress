@@ -14,7 +14,7 @@ func TestBasicPutGet(t *testing.T) {
 	os.Remove("/tmp/gogressdb")
 
 	db := &db.DB{
-		Idx: make(map[string]int64),
+		KeyOffsets: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
@@ -43,7 +43,7 @@ func TestBasicPutGet(t *testing.T) {
 
 func TestPut(t *testing.T) {
 	db := &db.DB{
-		Idx: make(map[string]int64),
+		KeyOffsets: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
@@ -101,7 +101,7 @@ func TestWriteToFile(t *testing.T) {
 
 func TestOverWriteExistingKey(t *testing.T) {
 	db := &db.DB{
-		Idx: make(map[string]int64),
+		KeyOffsets: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
