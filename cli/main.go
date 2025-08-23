@@ -32,16 +32,16 @@ func main() {
 				Name:        "get",
 				Aliases:     []string{"g"},
 				Usage:       "retrieve a value",
-				UsageText:   "get [key]",
+				UsageText:   "get [table] [key]",
 				Description: "retrieve a value by key",
 				ArgsUsage:   "[key]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					key := cmd.Args().Slice()[0]
-					content, ok, err := localDB.Get([]byte(key))
+					tableName := cmd.Args().Slice()[0]
+					key := cmd.Args().Slice()[1]
+					content, ok, err := localDB.Get([]byte(tableName), []byte(key))
 					if err != nil {
 						return err
 					}
-
 					if !ok {
 						fmt.Println("key not found")
 						return nil
@@ -55,12 +55,41 @@ func main() {
 				Name:        "put",
 				Aliases:     []string{"put"},
 				Usage:       "store a value",
-				UsageText:   "put [key] [value]",
+				UsageText:   "put [table] [key] [value]",
 				Description: "store a value by key",
-				ArgsUsage:   "[key] [value]",
+				ArgsUsage:   "[table] [key] [value]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					localDB.Put([]byte(cmd.Args().Slice()[0]), []byte(cmd.Args().Slice()[1]))
+					tableName := cmd.Args().Slice()[0]
+					key := cmd.Args().Slice()[1]
+					val := cmd.Args().Slice()[2]
+					if err := localDB.Put([]byte(tableName), []byte(key), []byte(val)); err != nil {
+						return err
+					}
 					return nil
+				},
+			},
+			{
+				Name:        "list-tables",
+				Aliases:     []string{"ls"},
+				Usage:       "list all tables",
+				UsageText:   "list",
+				Description: "list all tables",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					tables := localDB.ListTables()
+					for _, table := range tables {
+						fmt.Println(table)
+					}
+					return nil
+				},
+			},
+			{
+				Name:        "create-table",
+				Aliases:     []string{"ct"},
+				Usage:       "create a new table",
+				UsageText:   "create-table [name]",
+				Description: "create a new table",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					panic("unimplemented")
 				},
 			},
 		},

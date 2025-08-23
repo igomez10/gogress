@@ -11,25 +11,18 @@ import (
 
 func TestBasicPutGet(t *testing.T) {
 	// try to remove /tmp/db-
-	os.Remove("/tmp/gogressdb")
-
-	db := &db.DB{
-		KeyOffsets: make(map[string]int64),
-	}
-	f, err := os.Create("/tmp/gogressdb")
+	db, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Storage = f
-	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val := []byte("value1")
-	if err := db.Put(key, val); err != nil {
+	if err := db.Tables["default"].Put(key, val, func(i int64) {}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err := db.Get(key)
+	got, ok, err := db.Tables["default"].Get(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,28 +35,24 @@ func TestBasicPutGet(t *testing.T) {
 }
 
 func TestPut(t *testing.T) {
-	db := &db.DB{
-		KeyOffsets: make(map[string]int64),
-	}
-	f, err := os.Create("/tmp/gogressdb")
+	db, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Storage = f
-	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val := []byte("value1")
-	if err := db.Put(key, val); err != nil {
+	if err := db.Tables["default"].Put(key, val, func(i int64) {}); err != nil {
 		t.Fatal(err)
 	}
 
+	f := db.Tables["default"].Storage
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 
 	// check that value was written
-	content, err := io.ReadAll(db.Storage)
+	content, err := io.ReadAll(db.Tables["default"].Storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,28 +89,23 @@ func TestWriteToFile(t *testing.T) {
 }
 
 func TestOverWriteExistingKey(t *testing.T) {
-	db := &db.DB{
-		KeyOffsets: make(map[string]int64),
-	}
-	f, err := os.Create("/tmp/gogressdb")
+	db, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Storage = f
-	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val1 := []byte("value1")
-	if err := db.Put(key, val1); err != nil {
+	if err := db.Tables["default"].Put(key, val1, func(i int64) {}); err != nil {
 		t.Fatal(err)
 	}
 
 	val2 := []byte("value2")
-	if err := db.Put(key, val2); err != nil {
+	if err := db.Tables["default"].Put(key, val2, func(i int64) {}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err := db.Get(key)
+	got, ok, err := db.Tables["default"].Get(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,10 +116,10 @@ func TestOverWriteExistingKey(t *testing.T) {
 		t.Fatalf("expected %q, got %q", val2, got)
 	}
 	// expect to contain first value too in underlying file
-	if _, err := db.Storage.Seek(0, io.SeekStart); err != nil {
+	if _, err := db.Tables["default"].Storage.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	content, err := io.ReadAll(db.Storage)
+	content, err := io.ReadAll(db.Tables["default"].Storage)
 	if err != nil {
 		t.Fatal(err)
 	}

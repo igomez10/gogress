@@ -15,18 +15,20 @@ func Test_loadOperationsFromLogFile(t *testing.T) {
 	tests := []struct {
 		name        string
 		args        args
-		want        map[string]int64
+		want        map[string]map[string]int64
 		expectedErr error
 	}{
 		{
 			name: "valid log",
 			args: args{
 				idx:    make(map[string]int64),
-				reader: strings.NewReader("key1:1\nkey2:2\n"),
+				reader: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
 			},
-			want: map[string]int64{
-				"key1": 1,
-				"key2": 2,
+			want: map[string]map[string]int64{
+				"default": {
+					"key1": 1,
+					"key2": 2,
+				},
 			},
 		},
 		{
@@ -43,16 +45,18 @@ func Test_loadOperationsFromLogFile(t *testing.T) {
 				idx:    make(map[string]int64),
 				reader: strings.NewReader(""),
 			},
-			want: map[string]int64{},
+			want: map[string]map[string]int64{},
 		},
 		{
 			name: "overwrite old value",
 			args: args{
 				idx:    make(map[string]int64),
-				reader: strings.NewReader("key1:1\nkey1:2\n"),
+				reader: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
 			},
-			want: map[string]int64{
-				"key1": 2,
+			want: map[string]map[string]int64{
+				"default": {
+					"key1": 2,
+				},
 			},
 		},
 	}
@@ -63,9 +67,11 @@ func Test_loadOperationsFromLogFile(t *testing.T) {
 				t.Errorf("loadOperationsFromLogFile() error = %v, want %v", err, tt.expectedErr)
 			}
 
-			for k, v := range tt.want {
-				if got := offsets[k]; got != v {
-					t.Errorf("loadOperationsFromLogFile() = %v, want %v", got, v)
+			for tableName, idx := range tt.want {
+				for k, v := range idx {
+					if got := offsets[tableName][k]; got != v {
+						t.Errorf("loadOperationsFromLogFile() = %v, want %v", got, v)
+					}
 				}
 			}
 

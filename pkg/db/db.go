@@ -76,18 +76,22 @@ type NewDBOptions struct {
 
 func NewDB(opts NewDBOptions) (*DB, error) {
 	db := &DB{
-		Storage:    opts.File,
-		LogFile:    opts.LogFile,
+		LogFile: opts.LogFile,
+		Tables:  make(map[string]*Table),
+	}
+	// create default table
+	db.Tables["default"] = &Table{
 		KeyOffsets: make(map[string]int64),
+		Storage:    opts.File,
 	}
 
-	if db.Storage == nil {
+	if db.Tables["default"].Storage == nil {
 		// create but not truncate
-		f, err := os.OpenFile("/tmp/gogressdb", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		f, err := os.OpenFile("/tmp/gogressdb_default", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			return nil, err
 		}
-		db.Storage = f
+		db.Tables["default"].Storage = f
 	}
 
 	if db.LogFile == nil {
@@ -96,38 +100,43 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 	// load index from file
 	m, err := LoadOffsetsFromFile(db.LogFile)
+	for tableName, idx := range m {
+		db.Tables[tableName].KeyOffsets = idx
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	db.KeyOffsets = m
 
 	return db, nil
 }
 
 var InvalidLogLineError = errors.New("invalid log line")
 
-func LoadOffsetsFromFile(reader io.Reader) (map[string]int64, error) {
-	idx := map[string]int64{}
+// format is tableName key value
+func LoadOffsetsFromFile(reader io.Reader) (map[string]map[string]int64, error) {
+	idx := map[string]map[string]int64{}
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
 			return nil, InvalidLogLineError
 		}
-		key := parts[0]
-		off, err := strconv.ParseInt(parts[1], 10, 64)
+		tableName := parts[0]
+		key := parts[1]
+		off, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
 			return nil, InvalidLogLineError
 		}
-		idx[key] = off
+		if idx[tableName] == nil {
+			idx[tableName] = map[string]int64{}
+		}
+		idx[tableName][key] = off
 	}
 	return idx, nil
 }
 
 type DB struct {
-	Storage ReadWriteCloserSeeker
 	LogFile io.ReadWriter
 
 	// KeyOffsets is a mapping from keys to their file offsets
@@ -138,13 +147,60 @@ type DB struct {
 	// the value is the record's value, which is the file offset
 	// of the last record for that key. by offset we mean the byte offset
 	// from the beginning of the file to the start of the record.
-	KeyOffsets map[string]int64 // key -> file offset of last record
-	Mutex      sync.RWMutex
+	Mutex sync.RWMutex
+
+	Tables map[string]*Table
 }
 
-const paddingSize = 64
+func (db *DB) ListTables() []string {
+	db.Mutex.RLock()
+	defer db.Mutex.RUnlock()
 
-func (db *DB) Put(key, val []byte) error {
+	var tables []string
+	for name := range db.Tables {
+		tables = append(tables, name)
+	}
+	return tables
+}
+
+func (db *DB) Put(tableName, key, val []byte) error {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
+
+	table, ok := db.Tables[string(tableName)]
+	if !ok {
+		return fmt.Errorf("table %q not found", tableName)
+	}
+
+	hook := func(off int64) {
+		// write to log for crash recovery
+		fmt.Fprintln(db.LogFile, string(tableName)+":"+string(key)+":"+fmt.Sprintf("%d", off))
+	}
+
+	return table.Put(key, val, hook)
+}
+
+func (db *DB) Get(tableName, key []byte) ([]byte, bool, error) {
+	db.Mutex.RLock()
+	defer db.Mutex.RUnlock()
+
+	table, ok := db.Tables[string(tableName)]
+	if !ok {
+		return nil, false, fmt.Errorf("table %q not found", tableName)
+	}
+
+	return table.Get(key)
+}
+
+type Table struct {
+	KeyOffsets map[string]int64
+	Mutex      sync.RWMutex
+	Storage    ReadWriteCloserSeeker
+}
+
+const paddingSize = 16
+
+func (tb *Table) Put(key, val []byte, writeToLogHook func(int64)) error {
 	// Create a new record
 	if len(key)+len(val)+1 > paddingSize {
 		return fmt.Errorf("record too large")
@@ -159,20 +215,18 @@ func (db *DB) Put(key, val []byte) error {
 		rec = append(rec, 0)
 	}
 
-	db.Mutex.Lock()
-	defer db.Mutex.Unlock()
-	off, err := db.Storage.Seek(0, io.SeekEnd)
+	tb.Mutex.Lock()
+	defer tb.Mutex.Unlock()
+	off, err := tb.Storage.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
 	}
 
-	// write to log for crash recovery
-	if db.LogFile != nil {
-		fmt.Fprintln(db.LogFile, string(key)+":"+fmt.Sprintf("%d", off))
-	}
+	// TODO move to db
+	writeToLogHook(off)
 
 	// write record to file
-	sizewritten, err := db.Storage.Write(rec)
+	sizewritten, err := tb.Storage.Write(rec)
 	if err != nil {
 		return err
 	}
@@ -181,28 +235,28 @@ func (db *DB) Put(key, val []byte) error {
 	}
 
 	// flush on every write
-	if err := db.Storage.Sync(); err != nil {
+	if err := tb.Storage.Sync(); err != nil {
 		return err
 	}
 
 	// update offset for key
-	db.KeyOffsets[string(key)] = off
+	tb.KeyOffsets[string(key)] = off
 	return nil
 }
 
-func (db *DB) Get(key []byte) ([]byte, bool, error) {
-	db.Mutex.RLock()
-	off, ok := db.KeyOffsets[string(key)]
-	db.Mutex.RUnlock()
+func (tb *Table) Get(key []byte) ([]byte, bool, error) {
+	tb.Mutex.RLock()
+	off, ok := tb.KeyOffsets[string(key)]
+	tb.Mutex.RUnlock()
 	if !ok {
 		return nil, false, nil
 	}
 
-	if _, err := db.Storage.Seek(off, io.SeekStart); err != nil {
+	if _, err := tb.Storage.Seek(off, io.SeekStart); err != nil {
 		return nil, false, err
 	}
 
-	reader := io.LimitReader(db.Storage, paddingSize)
+	reader := io.LimitReader(tb.Storage, paddingSize)
 	buf := make([]byte, paddingSize)
 	if _, err := io.ReadFull(reader, buf); err != nil {
 		return nil, false, err
