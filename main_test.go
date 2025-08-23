@@ -5,21 +5,23 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	"github.com/igomez10/gogress/pkg/db"
 )
 
 func TestBasicPutGet(t *testing.T) {
 	// try to remove /tmp/db-
 	os.Remove("/tmp/gogressdb")
 
-	db := &DB{
-		idx: make(map[string]int64),
+	db := &db.DB{
+		Idx: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.storage = f
-	defer os.Remove(db.storage.Name())
+	db.Storage = f
+	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val := []byte("value1")
@@ -40,15 +42,15 @@ func TestBasicPutGet(t *testing.T) {
 }
 
 func TestPut(t *testing.T) {
-	db := &DB{
-		idx: make(map[string]int64),
+	db := &db.DB{
+		Idx: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.storage = f
-	defer os.Remove(db.storage.Name())
+	db.Storage = f
+	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val := []byte("value1")
@@ -61,7 +63,7 @@ func TestPut(t *testing.T) {
 	}
 
 	// check that value was written
-	content, err := io.ReadAll(db.storage)
+	content, err := io.ReadAll(db.Storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,15 +100,15 @@ func TestWriteToFile(t *testing.T) {
 }
 
 func TestOverWriteExistingKey(t *testing.T) {
-	db := &DB{
-		idx: make(map[string]int64),
+	db := &db.DB{
+		Idx: make(map[string]int64),
 	}
 	f, err := os.Create("/tmp/gogressdb")
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.storage = f
-	defer os.Remove(db.storage.Name())
+	db.Storage = f
+	defer os.Remove(db.Storage.Name())
 
 	key := []byte("key1")
 	val1 := []byte("value1")
@@ -130,10 +132,10 @@ func TestOverWriteExistingKey(t *testing.T) {
 		t.Fatalf("expected %q, got %q", val2, got)
 	}
 	// expect to contain first value too in underlying file
-	if _, err := db.storage.Seek(0, io.SeekStart); err != nil {
+	if _, err := db.Storage.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	content, err := io.ReadAll(db.storage)
+	content, err := io.ReadAll(db.Storage)
 	if err != nil {
 		t.Fatal(err)
 	}

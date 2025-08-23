@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/igomez10/gogress/pkg/db"
 	"github.com/urfave/cli/v3"
 )
 
 func main() {
-
-	// load db
+	localDB, err := db.NewDB(db.NewDBOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error loading db: %v\n", err)
+		os.Exit(1)
+	}
 
 	cmd := &cli.Command{
 		Name:  "gogress-cli",
@@ -24,7 +28,18 @@ func main() {
 				Description: "retrieve a value by key",
 				ArgsUsage:   "[key]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					fmt.Printf("get command %+v", cmd.Args().Slice())
+					key := cmd.Args().Slice()[0]
+					content, ok, err := localDB.Get([]byte(key))
+					if err != nil {
+						return err
+					}
+
+					if !ok {
+						fmt.Println("key not found")
+						return nil
+					}
+
+					fmt.Println(string(content))
 					return nil
 				},
 			},
