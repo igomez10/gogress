@@ -18,7 +18,7 @@ func TestBasicPutGet(t *testing.T) {
 
 	key := []byte("key1")
 	val := []byte("value1")
-	if err := db.Tables["default"].Put(key, val, func(i int64) {}); err != nil {
+	if err := db.Tables["default"].Put(key, val, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -42,7 +42,7 @@ func TestPut(t *testing.T) {
 
 	key := []byte("key1")
 	val := []byte("value1")
-	if err := db.Tables["default"].Put(key, val, func(i int64) {}); err != nil {
+	if err := db.Tables["default"].Put(key, val, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,12 +96,12 @@ func TestOverWriteExistingKey(t *testing.T) {
 
 	key := []byte("key1")
 	val1 := []byte("value1")
-	if err := db.Tables["default"].Put(key, val1, func(i int64) {}); err != nil {
+	if err := db.Tables["default"].Put(key, val1, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
 	val2 := []byte("value2")
-	if err := db.Tables["default"].Put(key, val2, func(i int64) {}); err != nil {
+	if err := db.Tables["default"].Put(key, val2, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
