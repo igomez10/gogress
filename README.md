@@ -53,7 +53,7 @@ hammer
 Clone the repository and navigate to the project folder:
 
 ```
-git clone github.com/igomez10/gogress
+git clone https://github.com/igomez10/gogress.git
 cd gogress
 ```
 
