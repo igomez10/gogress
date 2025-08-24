@@ -16,7 +16,7 @@ type Table struct {
 
 const paddingSize = 32
 
-func (tb *Table) Put(key, val []byte, writeToLogHook func(int64)) error {
+func (tb *Table) Put(key, val []byte, writeToLogHook func()) error {
 	// Create a new record
 	if len(key)+len(val)+1 > paddingSize {
 		return fmt.Errorf("record too large")
@@ -38,7 +38,7 @@ func (tb *Table) Put(key, val []byte, writeToLogHook func(int64)) error {
 		return err
 	}
 
-	writeToLogHook(off)
+	writeToLogHook()
 
 	// write record to file
 	sizewritten, err := tb.Storage.Write(rec)

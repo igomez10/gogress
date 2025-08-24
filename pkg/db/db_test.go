@@ -578,3 +578,32 @@ func TestReconcileChanges(t *testing.T) {
 		})
 	}
 }
+
+func TestFindTables(t *testing.T) {
+	prefix := "tmp/gogress_test/"
+	if err := os.MkdirAll(prefix, 0755); err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	f1, err := os.CreateTemp(prefix, "file1.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	f2, err := os.CreateTemp(prefix, "file2.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	f3, err := os.CreateTemp(prefix, "file3.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+
+	defer os.Remove(f1.Name())
+	defer os.Remove(f2.Name())
+	defer os.Remove(f3.Name())
+
+	arr := findTables(prefix)
+
+	if len(arr) != 3 {
+		t.Errorf("findTables() = %v, want 3", arr)
+	}
+}

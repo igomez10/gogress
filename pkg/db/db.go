@@ -16,8 +16,14 @@ type NewDBOptions struct {
 	LogFile io.ReadWriter
 }
 
+var storagePrefix = "/tmp/gogress/"
+
 func initializeStorage(storageName string) (ReadWriteCloserSeeker, error) {
-	f, err := os.OpenFile("/tmp/gogressdb_"+storageName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	// make sure prefix exists
+	if err := os.MkdirAll(storagePrefix, 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(storagePrefix+storageName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		return nil, err
 	}
@@ -50,16 +56,48 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 	// load index from file
 	// TODO add list of storage files
+	tables := findTables(storagePrefix)
 	storageFiles := map[string]io.ReadWriteSeeker{}
-	m, err := BuildIndex(db.LogFile, storageFiles)
-	for tableName, idx := range m {
-		db.Tables[tableName].KeyOffsets = idx
+	for _, table := range tables {
+		splitted := strings.Split(table.Name(), "/")
+		tableName := splitted[len(splitted)-1]
+		storageFiles[tableName] = table
+		if db.Tables[tableName] == nil {
+			db.Tables[tableName] = &Table{
+				KeyOffsets: make(map[string]int64),
+				Storage:    table,
+			}
+		}
 	}
+	m, err := BuildIndex(db.LogFile, storageFiles)
 	if err != nil {
 		return nil, err
 	}
+	for tableName, idx := range m {
+		db.Tables[tableName].KeyOffsets = idx
+	}
 
 	return db, nil
+}
+
+// find tables in dir that match prefix and return them, these are the tables
+func findTables(storagePrefix string) []*os.File {
+	var tables []*os.File
+	files, err := os.ReadDir(storagePrefix)
+	if err != nil {
+		return nil
+	}
+	for _, file := range files {
+		if file.IsDir() || file.Name() == ".DS_Store" {
+			continue
+		}
+		f, err := os.OpenFile(storagePrefix+file.Name(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		if err != nil {
+			return nil
+		}
+		tables = append(tables, f)
+	}
+	return tables
 }
 
 var InvalidLogLineError = errors.New("invalid log line")
@@ -109,7 +147,8 @@ func ReconcileChanges(finalIndex map[string]map[string]int64, changeLog map[stri
 					Key:   []byte(key),
 					Value: []byte(value),
 				}
-				offset, err := WriteRecordToFile(storageFiles[tableName], newrecord)
+				tableFile := storageFiles[tableName]
+				offset, err := WriteRecordToFile(tableFile, newrecord)
 				if err != nil {
 					return 0, err
 				}
@@ -240,9 +279,9 @@ func (db *DB) Put(tableName, key, val []byte) error {
 		return fmt.Errorf("table %q not found", tableName)
 	}
 
-	hook := func(off int64) {
+	hook := func() {
 		// write to log for crash recovery
-		fmt.Fprintln(db.LogFile, string(tableName)+":"+string(key)+":"+fmt.Sprintf("%d", off))
+		fmt.Fprintln(db.LogFile, string(tableName)+":"+string(key)+":"+string(val))
 	}
 
 	return table.Put(key, val, hook)
