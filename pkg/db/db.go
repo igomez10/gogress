@@ -107,14 +107,13 @@ var InvalidLogLineError = errors.New("invalid log line")
 func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string]map[string]int64, error) {
 	finalIndex := map[string]map[string]int64{}
 	// Scan storage files
-	indexFromStorage := map[string]map[string]int64{}
 	for tableName, storage := range storageFiles {
 		storageTableIdx, err := BuildIndexFromStorage(storage)
 		if err != nil {
 			return nil, err
 		}
 
-		indexFromStorage[tableName] = storageTableIdx
+		finalIndex[tableName] = storageTableIdx
 	}
 
 	// Load WAL
@@ -259,6 +258,49 @@ type DB struct {
 	Tables map[string]*Table
 }
 
+func (db *DB) Close() error {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
+
+	for _, table := range db.Tables {
+		if err := table.Storage.Close(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type ScanOptions struct {
+	Limit  int
+	Offset int
+}
+
+func (db *DB) Scan(tableName string, scanOptions ScanOptions) ([]Record, error) {
+	db.Mutex.RLock()
+	defer db.Mutex.RUnlock()
+
+	table, ok := db.Tables[tableName]
+	if !ok {
+		return nil, fmt.Errorf("table %q not found", tableName)
+	}
+
+	var records []Record
+	for key := range table.KeyOffsets {
+		val, found, err := table.Get([]byte(key))
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			records = append(records, Record{
+				Key:   []byte(key),
+				Value: val,
+			})
+		}
+	}
+	return records, nil
+}
+
 func (db *DB) ListTables() []string {
 	db.Mutex.RLock()
 	defer db.Mutex.RUnlock()
@@ -327,5 +369,70 @@ func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
 		db.Tables[tableName].Storage = f
 	}
 
+	return nil
+}
+
+func (db *DB) SQL(query string) error {
+	// For now, just print the query
+	fmt.Println("Executing SQL query:", query)
+	ParseQuery(db, query)
+	return nil
+}
+
+func ParseQuery(db *DB, query string) {
+	query = strings.TrimSpace(query)
+	parts := strings.Fields(query)
+	if len(parts) == 0 {
+		return
+	}
+
+	switch parts[0] {
+	case "select", "SELECT":
+		// Handle SELECT queries
+		columns := parts[1]
+		table := parts[3]
+		fmt.Println("Selecting columns:", columns, "from table:", table)
+
+	// case "INSERT":
+	// 	// Handle INSERT queries
+	// case "UPDATE":
+	// 	// Handle UPDATE queries
+	// case "DELETE":
+	// 	// Handle DELETE queries
+	default:
+		panic("unsupported query")
+	}
+}
+
+var DeleteDefaultTableError = errors.New("cannot delete default table")
+
+// DeleteTable removes a table from the DB, closing and deleting its storage file.
+func (db *DB) DeleteTable(tableName string) error {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
+
+	if tableName == "default" {
+		return DeleteDefaultTableError
+	}
+
+	table, ok := db.Tables[tableName]
+	if !ok {
+		return fmt.Errorf("table %q not found", tableName)
+	}
+
+	// Attempt to close the storage
+	if table.Storage != nil {
+		if err := table.Storage.Close(); err != nil {
+			return err
+		}
+		// Try to delete the underlying file; ignore errors (e.g., mock storages)
+		if name := table.Storage.Name(); name != "" {
+			if err := os.Remove(name); err != nil {
+				return err
+			}
+		}
+	}
+
+	delete(db.Tables, tableName)
 	return nil
 }

@@ -607,3 +607,50 @@ func TestFindTables(t *testing.T) {
 		t.Errorf("findTables() = %v, want 3", arr)
 	}
 }
+
+func TestDB_DeleteTable_DefaultTableError(t *testing.T) {
+	db := &DB{
+		Tables: map[string]*Table{
+			"default": {},
+		},
+	}
+
+	if err := db.DeleteTable("default"); !errors.Is(err, DeleteDefaultTableError) {
+		t.Fatalf("DeleteTable(default) error = %v, want %v", err, DeleteDefaultTableError)
+	}
+}
+
+func TestDB_DeleteTable_RemovesFileAndEntry(t *testing.T) {
+	f, err := os.CreateTemp("", "table-*")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	// Do not defer f.Close/remove here; DeleteTable should handle it
+	path := f.Name()
+
+	db := &DB{
+		Tables: map[string]*Table{
+			"foo":     {KeyOffsets: make(map[string]int64), Storage: f},
+			"default": {},
+		},
+	}
+
+	if err := db.DeleteTable("foo"); err != nil {
+		t.Fatalf("DeleteTable(foo) error = %v, want nil", err)
+	}
+
+	if _, ok := db.Tables["foo"]; ok {
+		t.Fatalf("table entry not removed from DB map")
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected storage file to be removed, got err = %v", err)
+	}
+}
+
+func TestDB_DeleteTable_TableNotFound(t *testing.T) {
+	db := &DB{Tables: map[string]*Table{"default": {}}}
+	if err := db.DeleteTable("missing"); err == nil {
+		t.Fatalf("DeleteTable(missing) expected error, got nil")
+	}
+}

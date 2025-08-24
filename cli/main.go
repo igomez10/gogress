@@ -96,6 +96,65 @@ func main() {
 					return nil
 				},
 			},
+			{
+				Name:        "delete-table",
+				Aliases:     []string{"dt"},
+				Usage:       "delete a table",
+				UsageText:   "delete-table [name]",
+				Description: "delete a table",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					tableName := cmd.Args().Slice()[0]
+					if err := localDB.DeleteTable(tableName); err != nil {
+						return err
+					}
+					return nil
+				},
+			},
+			{
+				Name:        "sql",
+				Usage:       "execute a SQL query",
+				UsageText:   "sql [query]",
+				Description: "execute a SQL query",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					query := cmd.Args().Slice()[0]
+					fmt.Println("Executing query:", query)
+					if err := localDB.SQL(query); err != nil {
+						return err
+					}
+					return nil
+				},
+			},
+			{
+				Name:        "scan",
+				Usage:       "scan a table",
+				UsageText:   "scan [table]",
+				Description: "scan a table for all records",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "limit",
+						Usage: "limit the number of records returned",
+					},
+					&cli.IntFlag{
+						Name:  "offset",
+						Usage: "skip a number of records",
+					},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					tableName := cmd.Args().Slice()[0]
+					opts := db.ScanOptions{
+						Limit:  cmd.Int("limit"),
+						Offset: cmd.Int("offset"),
+					}
+					res, err := localDB.Scan(tableName, opts)
+					if err != nil {
+						return err
+					}
+					for _, record := range res {
+						fmt.Printf("%s: %s\n", record.Key, record.Value)
+					}
+					return nil
+				},
+			},
 		},
 	}
 
