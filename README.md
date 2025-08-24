@@ -2,7 +2,8 @@
 
 **gogress** is a lightweight Go-based file storage database with a simple write-ahead log (WAL) mechanism. It supports table creation, basic key-value operations, and crash recovery by replaying log files.
 
-### Example with CLI
+## Example with CLI
+
 ```bash
 # Start the CLI
 gogress-cli list-tables
@@ -52,7 +53,7 @@ hammer
 
 Clone the repository and navigate to the project folder:
 
-```
+```bash
 git clone https://github.com/igomez10/gogress.git
 cd gogress
 ```
@@ -61,7 +62,7 @@ cd gogress
 
 Build the project using `go build`:
 
-```
+```bash
 go build -o gogress-cli cli/main.go
 ```
 
@@ -69,13 +70,13 @@ go build -o gogress-cli cli/main.go
 
 Run all tests with:
 
-```
+```bash
 go test ./...
 ```
 
 Or test specific packages:
 
-```
+```bash
 go test ./pkg/db
 ```
 
