@@ -372,26 +372,27 @@ func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
 	return nil
 }
 
-func (db *DB) SQL(query string) error {
+func (db *DB) SQL(query string) ([]Record, error) {
 	// For now, just print the query
-	fmt.Println("Executing SQL query:", query)
-	ParseQuery(db, query)
-	return nil
-}
-
-func ParseQuery(db *DB, query string) {
 	query = strings.TrimSpace(query)
 	parts := strings.Fields(query)
 	if len(parts) == 0 {
-		return
+		return nil, nil
 	}
 
 	switch parts[0] {
 	case "select", "SELECT":
 		// Handle SELECT queries
-		columns := parts[1]
+		// columns := parts[1]
 		table := parts[3]
-		fmt.Println("Selecting columns:", columns, "from table:", table)
+		records, err := db.Scan(table, ScanOptions{
+			Limit:  10,
+			Offset: 0,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return records, nil
 
 	// case "INSERT":
 	// 	// Handle INSERT queries

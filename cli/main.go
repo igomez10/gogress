@@ -117,9 +117,12 @@ func main() {
 				Description: "execute a SQL query",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					query := cmd.Args().Slice()[0]
-					fmt.Println("Executing query:", query)
-					if err := localDB.SQL(query); err != nil {
+					records, err := localDB.SQL(query)
+					if err != nil {
 						return err
+					}
+					for _, record := range records {
+						fmt.Printf("%s: %s\n", record.Key, record.Value)
 					}
 					return nil
 				},
