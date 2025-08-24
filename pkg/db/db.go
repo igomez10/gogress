@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -51,7 +50,7 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 
 	// load index from file
 	// TODO add list of storage files
-	storageFiles := map[string]io.ReadSeeker{}
+	storageFiles := map[string]io.ReadWriteSeeker{}
 	m, err := BuildIndex(db.LogFile, storageFiles)
 	for tableName, idx := range m {
 		db.Tables[tableName].KeyOffsets = idx
@@ -67,7 +66,7 @@ var InvalidLogLineError = errors.New("invalid log line")
 
 // format is tableName:key:value
 // For crash recovery we scan the storage and apply the log
-func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadSeeker) (map[string]map[string]int64, error) {
+func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string]map[string]int64, error) {
 	finalIndex := map[string]map[string]int64{}
 	// Scan storage files
 	indexFromStorage := map[string]map[string]int64{}
@@ -80,29 +79,80 @@ func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadSeeker) (map[s
 		indexFromStorage[tableName] = storageTableIdx
 	}
 
-	// Scan WAL
-	indexFromWal, err := BuildIndexFromWAL(walFile, storageFiles)
+	// Load WAL
+	changeLog, err := ParseWAL(walFile, storageFiles)
 	if err != nil {
 		return nil, err
 	}
 
-	for tableName := range indexFromStorage {
-		finalIndex[tableName] = indexFromStorage[tableName]
-	}
-
-	for tableName := range indexFromWal {
-		for k, v := range indexFromWal[tableName] {
-			if finalIndex[tableName] == nil {
-				finalIndex[tableName] = map[string]int64{}
-			}
-			finalIndex[tableName][k] = v
-		}
+	// Reconcile changes
+	if _, err := ReconcileChanges(finalIndex, changeLog, storageFiles); err != nil {
+		return nil, err
 	}
 
 	return finalIndex, nil
 }
 
+func ReconcileChanges(finalIndex map[string]map[string]int64, changeLog map[string]map[string]string, storageFiles map[string]io.ReadWriteSeeker) (int64, error) {
+	var totalChanges int64
+	for tableName, tableChanges := range changeLog {
+		if finalIndex[tableName] == nil {
+			finalIndex[tableName] = map[string]int64{}
+		}
+
+		// check all changes and compare current stored version with new version
+		for key, value := range tableChanges {
+			offset, ok := finalIndex[tableName][key]
+			if !ok {
+				// key not found in index, add it
+				newrecord := Record{
+					Key:   []byte(key),
+					Value: []byte(value),
+				}
+				offset, err := WriteRecordToFile(storageFiles[tableName], newrecord)
+				if err != nil {
+					return 0, err
+				}
+
+				// update index in finalIndex
+				finalIndex[tableName][key] = offset
+				totalChanges++
+				continue
+			}
+
+			record, err := ReadRecordFromFile(storageFiles[tableName], offset)
+			if err != nil {
+				return 0, err
+			}
+			if string(record.Key) != key {
+				return 0, fmt.Errorf("key mismatch: expected %q, got %q", key, record.Key)
+			}
+			if string(record.Value) != value {
+				// found key with stale value, update with new value
+				newrecord := Record{
+					Key:   []byte(key),
+					Value: []byte(value),
+				}
+				offset, err := WriteRecordToFile(storageFiles[tableName], newrecord)
+				if err != nil {
+					return 0, err
+				}
+
+				// update index in finalIndex
+				finalIndex[tableName][key] = offset
+
+				totalChanges++
+			}
+		}
+	}
+	return totalChanges, nil
+}
+
 func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
+	if storage == nil {
+		return map[string]int64{}, nil
+	}
+
 	idx := map[string]int64{}
 	currentOffset := 0
 	for {
@@ -132,8 +182,8 @@ func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
 	}
 }
 
-func BuildIndexFromWAL(walFile io.Reader, storageFiles map[string]io.ReadSeeker) (map[string]map[string]int64, error) {
-	idx := map[string]map[string]int64{}
+func ParseWAL(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string]map[string]string, error) {
+	changeLog := map[string]map[string]string{}
 	scanner := bufio.NewScanner(walFile)
 
 	for scanner.Scan() {
@@ -144,16 +194,14 @@ func BuildIndexFromWAL(walFile io.Reader, storageFiles map[string]io.ReadSeeker)
 		}
 		tableName := parts[0]
 		key := parts[1]
-		off, err := strconv.ParseInt(parts[2], 10, 64)
-		if err != nil {
-			return nil, InvalidLogLineError
+		value := parts[2]
+		if changeLog[tableName] == nil {
+			changeLog[tableName] = map[string]string{}
 		}
-		if idx[tableName] == nil {
-			idx[tableName] = map[string]int64{}
-		}
-		idx[tableName][key] = off
+		changeLog[tableName][key] = value
 	}
-	return idx, nil
+
+	return changeLog, nil
 }
 
 type DB struct {

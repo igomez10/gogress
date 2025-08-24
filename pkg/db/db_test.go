@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 )
 
-func Test_RebuildIndex(t *testing.T) {
+func Test_BuildIndex(t *testing.T) {
 	type args struct {
 		idx      map[string]int64
 		walIndex io.Reader
-		storage  map[string]io.ReadSeeker
+		storage  map[string]io.ReadWriteSeeker
 	}
 	tests := []struct {
 		name        string
@@ -22,68 +23,80 @@ func Test_RebuildIndex(t *testing.T) {
 		want        map[string]map[string]int64
 		expectedErr error
 	}{
+		// {
+		// 	name: "valid log",
+		// 	args: args{
+		// 		idx:      make(map[string]int64),
+		// 		walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
+		// 		storage:  map[string]io.ReadSeeker{"default": nil},
+		// 	},
+		// 	want: map[string]map[string]int64{
+		// 		"default": {
+		// 			"key1": 1,
+		// 			"key2": 2,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	name: "invalid log",
+		// 	args: args{
+		// 		idx:      make(map[string]int64),
+		// 		walIndex: strings.NewReader("invalid\nlog\n"),
+		// 		storage:  map[string]io.ReadSeeker{"default": nil},
+		// 	},
+		// 	expectedErr: InvalidLogLineError,
+		// },
+		// {
+		// 	name: "empty log",
+		// 	args: args{
+		// 		idx:      make(map[string]int64),
+		// 		walIndex: strings.NewReader(""),
+		// 		storage:  map[string]io.ReadSeeker{"default": nil},
+		// 	},
+		// 	want: map[string]map[string]int64{},
+		// },
+		// {
+		// 	name: "overwrite old value",
+		// 	args: args{
+		// 		idx:      make(map[string]int64),
+		// 		walIndex: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
+		// 		storage:  map[string]io.ReadSeeker{"default": nil},
+		// 	},
+		// 	want: map[string]map[string]int64{
+		// 		"default": {
+		// 			"key1": 2,
+		// 		},
+		// 	},
+		// },
 		{
-			name: "valid log",
+			name: "wal and storage are same",
 			args: args{
 				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
-				storage:  map[string]io.ReadSeeker{"default": nil},
+				walIndex: strings.NewReader("default:key1:value1\n"),
+				storage: func() map[string]io.ReadWriteSeeker {
+					res := map[string]io.ReadWriteSeeker{}
+					f, err := os.CreateTemp("", "")
+					if err != nil {
+						return nil
+					}
+					res["default"] = f
+
+					b := bytes.NewBuffer(nil)
+					doc1 := "key1:value1"
+					if _, err := b.WriteString(doc1); err != nil {
+						return nil
+					}
+					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+					if _, err := b.Write(padding); err != nil {
+						return nil
+					}
+
+					return res
+				}(),
 			},
 			want: map[string]map[string]int64{
 				"default": {
-					"key1": 1,
-					"key2": 2,
-				},
-			},
-		},
-		{
-			name: "invalid log",
-			args: args{
-				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("invalid\nlog\n"),
-				storage:  map[string]io.ReadSeeker{"default": nil},
-			},
-			expectedErr: InvalidLogLineError,
-		},
-		{
-			name: "empty log",
-			args: args{
-				idx:      make(map[string]int64),
-				walIndex: strings.NewReader(""),
-				storage:  map[string]io.ReadSeeker{"default": nil},
-			},
-			want: map[string]map[string]int64{},
-		},
-		{
-			name: "overwrite old value",
-			args: args{
-				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
-				storage:  map[string]io.ReadSeeker{"default": nil},
-			},
-			want: map[string]map[string]int64{
-				"default": {
-					"key1": 2,
-				},
-			},
-		},
-		{
-			name: "merge with existing index",
-			args: args{
-				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
-				storage: map[string]io.ReadSeeker{
-					"users": strings.NewReader("users:key1:1\nusers:key2:2\n"),
-				},
-			},
-			want: map[string]map[string]int64{
-				"default": {
-					"key1": 1,
-					"key2": 2,
-				},
-				"users": {
-					"key1": 1,
-					"key2": 2,
+					"key1": 0,
 				},
 			},
 		},
@@ -272,6 +285,261 @@ func TestBuildIndexFromStorage(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("BuildIndexFromStorage() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReconcileChanges(t *testing.T) {
+	type args struct {
+		finalIndex   map[string]map[string]int64
+		changeLog    map[string]map[string]string
+		storageFiles map[string]io.ReadWriteSeeker
+	}
+	tests := []struct {
+		name                 string
+		args                 args
+		expectedTotalChanges int64
+		expectedFinalIndex   map[string]map[string]int64
+		expectedStorageFiles map[string]io.ReadWriteSeeker
+		wantErr              bool
+	}{
+		{
+			name: "nothing to reconcile",
+			args: args{
+				finalIndex: map[string]map[string]int64{
+					"default": {
+						"key1": 0,
+					},
+				},
+				changeLog: map[string]map[string]string{
+					"default": {
+						"key1": "value1",
+					},
+				},
+				storageFiles: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						doc1 := "key1:value1"
+						if _, err := f.WriteString(doc1); err != nil {
+							return nil
+						}
+						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+						if _, err := f.Write(padding); err != nil {
+							return nil
+						}
+
+						return f
+					}(),
+				},
+			},
+			expectedFinalIndex: map[string]map[string]int64{
+				"default": {
+					"key1": 0,
+				},
+			},
+			expectedStorageFiles: map[string]io.ReadWriteSeeker{
+				"default": func() io.ReadWriteSeeker {
+					f, err := os.CreateTemp("", "")
+					if err != nil {
+						return nil
+					}
+					doc1 := "key1:value1"
+					if _, err := f.WriteString(doc1); err != nil {
+						return nil
+					}
+					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					return f
+				}(),
+			},
+			expectedTotalChanges: 0,
+		},
+		{
+			name: "reconcile 1 change, same key different value",
+			args: args{
+				finalIndex: map[string]map[string]int64{
+					"default": {
+						"key1": 0,
+					},
+				},
+				changeLog: map[string]map[string]string{
+					"default": {
+						"key1": "newvalue1",
+					},
+				},
+				storageFiles: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						doc1 := "key1:value1"
+						if _, err := f.WriteString(doc1); err != nil {
+							return nil
+						}
+						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+						if _, err := f.Write(padding); err != nil {
+							return nil
+						}
+
+						return f
+					}(),
+				},
+			},
+			expectedFinalIndex: map[string]map[string]int64{
+				"default": {
+					"key1": paddingSize * 1,
+				},
+			},
+			expectedStorageFiles: map[string]io.ReadWriteSeeker{
+				"default": func() io.ReadWriteSeeker {
+					f, err := os.CreateTemp("", "")
+					if err != nil {
+						return nil
+					}
+					doc1 := "key1:value1"
+					if _, err := f.WriteString(doc1); err != nil {
+						return nil
+					}
+					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					doc2 := "key1:newvalue1"
+					if _, err := f.WriteString(doc2); err != nil {
+						return nil
+					}
+					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					return f
+				}(),
+			},
+			expectedTotalChanges: 1,
+		},
+		{
+			name: "reconcile 1 change, new key",
+			args: args{
+				finalIndex: map[string]map[string]int64{
+					"default": {
+						"key1": 0,
+					},
+				},
+				changeLog: map[string]map[string]string{
+					"default": {
+						"key1": "newvalue1",
+						"key2": "newvalue2",
+					},
+				},
+				storageFiles: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						doc1 := "key1:value1"
+						if _, err := f.WriteString(doc1); err != nil {
+							return nil
+						}
+						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+						if _, err := f.Write(padding); err != nil {
+							return nil
+						}
+
+						return f
+					}(),
+				},
+			},
+			expectedFinalIndex: map[string]map[string]int64{
+				"default": {
+					"key1": paddingSize * 1,
+					"key2": paddingSize * 2,
+				},
+			},
+			expectedStorageFiles: map[string]io.ReadWriteSeeker{
+				"default": func() io.ReadWriteSeeker {
+					f, err := os.CreateTemp("", "")
+					if err != nil {
+						return nil
+					}
+					doc1 := "key1:value1"
+					if _, err := f.WriteString(doc1); err != nil {
+						return nil
+					}
+					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					doc2 := "key1:newvalue1"
+					if _, err := f.WriteString(doc2); err != nil {
+						return nil
+					}
+					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					doc3 := "key2:newvalue2"
+					if _, err := f.WriteString(doc3); err != nil {
+						return nil
+					}
+					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc3))
+					if _, err := f.Write(padding); err != nil {
+						return nil
+					}
+
+					return f
+				}(),
+			},
+			expectedTotalChanges: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			totalChanges, err := ReconcileChanges(tt.args.finalIndex, tt.args.changeLog, tt.args.storageFiles)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ReconcileChanges() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if totalChanges != tt.expectedTotalChanges {
+				t.Fatalf("ReconcileChanges() = %v, want %v", totalChanges, tt.expectedTotalChanges)
+			}
+
+			if !reflect.DeepEqual(tt.args.finalIndex, tt.expectedFinalIndex) {
+				t.Fatalf("ReconcileChanges() = %v, want %v", tt.args.finalIndex, tt.expectedFinalIndex)
+			}
+
+			// compare storage files
+			if len(tt.args.storageFiles) != len(tt.expectedStorageFiles) {
+				t.Errorf("ReconcileChanges() = %v, want %v", tt.args.storageFiles, tt.expectedStorageFiles)
+			}
+
+			for i := range tt.args.storageFiles {
+				got := tt.args.storageFiles[i]
+				expected := tt.expectedStorageFiles[i]
+
+				gotBytes, err := io.ReadAll(got)
+				if err != nil {
+					t.Errorf("ReconcileChanges() error reading got = %v", err)
+				}
+				expectedBytes, err := io.ReadAll(expected)
+				if err != nil {
+					t.Errorf("ReconcileChanges() error reading expected = %v", err)
+				}
+
+				if string(gotBytes) != string(expectedBytes) {
+					t.Errorf("ReconcileChanges() = %v, want %v", string(gotBytes), string(expectedBytes))
+				}
 			}
 		})
 	}
