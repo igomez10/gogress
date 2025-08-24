@@ -23,51 +23,85 @@ func Test_BuildIndex(t *testing.T) {
 		want        map[string]map[string]int64
 		expectedErr error
 	}{
-		// {
-		// 	name: "valid log",
-		// 	args: args{
-		// 		idx:      make(map[string]int64),
-		// 		walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
-		// 		storage:  map[string]io.ReadSeeker{"default": nil},
-		// 	},
-		// 	want: map[string]map[string]int64{
-		// 		"default": {
-		// 			"key1": 1,
-		// 			"key2": 2,
-		// 		},
-		// 	},
-		// },
-		// {
-		// 	name: "invalid log",
-		// 	args: args{
-		// 		idx:      make(map[string]int64),
-		// 		walIndex: strings.NewReader("invalid\nlog\n"),
-		// 		storage:  map[string]io.ReadSeeker{"default": nil},
-		// 	},
-		// 	expectedErr: InvalidLogLineError,
-		// },
-		// {
-		// 	name: "empty log",
-		// 	args: args{
-		// 		idx:      make(map[string]int64),
-		// 		walIndex: strings.NewReader(""),
-		// 		storage:  map[string]io.ReadSeeker{"default": nil},
-		// 	},
-		// 	want: map[string]map[string]int64{},
-		// },
-		// {
-		// 	name: "overwrite old value",
-		// 	args: args{
-		// 		idx:      make(map[string]int64),
-		// 		walIndex: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
-		// 		storage:  map[string]io.ReadSeeker{"default": nil},
-		// 	},
-		// 	want: map[string]map[string]int64{
-		// 		"default": {
-		// 			"key1": 2,
-		// 		},
-		// 	},
-		// },
+		{
+			name: "valid log",
+			args: args{
+				idx:      make(map[string]int64),
+				walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
+				storage: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						return f
+					}(),
+				},
+			},
+			want: map[string]map[string]int64{
+				"default": {
+					"key1": paddingSize * 0,
+					"key2": paddingSize * 1,
+				},
+			},
+		},
+		{
+			name: "invalid log",
+			args: args{
+				idx:      make(map[string]int64),
+				walIndex: strings.NewReader("invalid\nlog\n"),
+				storage: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						return f
+					}(),
+				},
+			},
+			expectedErr: InvalidLogLineError,
+		},
+		{
+			name: "empty log",
+			args: args{
+				idx:      make(map[string]int64),
+				walIndex: strings.NewReader(""),
+				storage: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						return f
+					}(),
+				},
+			},
+			want: map[string]map[string]int64{},
+		},
+		{
+			name: "overwrite old value",
+			args: args{
+				idx:      make(map[string]int64),
+				walIndex: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
+				storage: map[string]io.ReadWriteSeeker{
+					"default": func() io.ReadWriteSeeker {
+						f, err := os.CreateTemp("", "")
+						if err != nil {
+							return nil
+						}
+						f.Write([]byte("key1:value1"))
+						f.Write(bytes.Repeat([]byte{0}, paddingSize-len("key1:value1")))
+						return f
+					}(),
+				},
+			},
+			want: map[string]map[string]int64{
+				"default": {
+					"key1": paddingSize * 1,
+				},
+			},
+		},
 		{
 			name: "wal and storage are same",
 			args: args{
