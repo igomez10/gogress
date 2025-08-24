@@ -53,7 +53,7 @@ hammer
 Clone the repository and navigate to the project folder:
 
 ```
-git clone <repository-url>
+git clone github.com/igomez10/gogress
 cd gogress
 ```
 
@@ -62,7 +62,7 @@ cd gogress
 Build the project using `go build`:
 
 ```
-go build -o gogress-cli main.go
+go build -o gogress-cli cli/main.go
 ```
 
 ### Running Tests
