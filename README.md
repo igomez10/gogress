@@ -21,6 +21,10 @@ gogress-cli put products sku123 hammer
 # get a record
 gogress-cli get products sku123
 hammer
+
+# run a simple SQL query (experimental)
+gogress-cli sql "select * from products"
+sku123: hammer
 ```
 
 ## Project Structure
@@ -36,6 +40,7 @@ hammer
   - [`db.NewDB`](pkg/db/db.go): Initializes a new database instance.
   - [`db.Table`](pkg/db/table.go): Provides methods like `Put` and `Get` to store and retrieve records.
   - Write-ahead logging and crash recovery is managed in [`db.BuildIndex`](pkg/db/db.go).
+  - Experimental SQL entrypoint [`db.SQL`](pkg/db/db.go) powering the `sql` CLI subcommand.
 
 - **Tests**  
   Unit tests cover various components:
@@ -92,12 +97,50 @@ Examples of operations include:
 - **Get a Record:**  
   See [`db.Table.Get`](pkg/db/table.go) for retrieving stored values.
 
+### SQL (experimental)
+
+You can run a very small subset of SQL via the CLI or directly from Go. Currently supported:
+
+- SELECT with a FROM clause: `select * from <table>`
+  - The query is tokenized by whitespace; the table name is read from the token after `from`.
+  - Returns up to 10 records by default; filters, ordering, projections, and joins are not supported yet.
+
+CLI example:
+
+```bash
+gogress-cli sql "select * from products"
+```
+
+Programmatic example:
+
+```go
+records, err := db.SQL("select * from products")
+if err != nil {
+    // handle error
+}
+for _, r := range records {
+    fmt.Printf("%s: %s\n", r.Key, r.Value)
+}
+```
+
 ## Storage and Recovery
 
 - **Storage Files:**  
   Data is stored in files under `/tmp/gogress/` (as set in [`db.initializeStorage`](pkg/db/db.go)).  
 - **Crash Recovery:**  
   A write-ahead log (WAL) is maintained and used to rebuild the in-memory index via [`db.BuildIndex`](pkg/db/db.go).
+
+## CLI commands overview
+
+- Tables
+  - Create: `gogress-cli create-table <name>`
+  - List: `gogress-cli list-tables`
+  - Delete: `gogress-cli delete-table <name>`
+- Data
+  - Put: `gogress-cli put <table> <key> <value>`
+  - Get: `gogress-cli get <table> <key>`
+  - Scan: `gogress-cli scan <table> [--limit N] [--offset N]`
+  - SQL (experimental): `gogress-cli sql "select * from <table>"`
 
 ## Contributing
 
