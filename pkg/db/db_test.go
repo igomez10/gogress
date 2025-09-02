@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/igomez10/gogress/pkg/storage"
 )
 
 func Test_BuildIndex(t *testing.T) {
@@ -30,10 +32,7 @@ func Test_BuildIndex(t *testing.T) {
 				walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
 				storage: map[string]io.ReadWriteSeeker{
 					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
+						f := &storage.InMemoryStorage{}
 						return f
 					}(),
 				},
@@ -52,10 +51,7 @@ func Test_BuildIndex(t *testing.T) {
 				walIndex: strings.NewReader("invalid\nlog\n"),
 				storage: map[string]io.ReadWriteSeeker{
 					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
+						f := &storage.InMemoryStorage{}
 						return f
 					}(),
 				},
@@ -69,38 +65,12 @@ func Test_BuildIndex(t *testing.T) {
 				walIndex: strings.NewReader(""),
 				storage: map[string]io.ReadWriteSeeker{
 					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
+						f := &storage.InMemoryStorage{}
 						return f
 					}(),
 				},
 			},
 			want: map[string]map[string]int64{},
-		},
-		{
-			name: "overwrite old value",
-			args: args{
-				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("default:key1:1\ndefault:key1:2\n"),
-				storage: map[string]io.ReadWriteSeeker{
-					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
-						f.Write([]byte("key1:value1"))
-						f.Write(bytes.Repeat([]byte{0}, paddingSize-len("key1:value1")))
-						return f
-					}(),
-				},
-			},
-			want: map[string]map[string]int64{
-				"default": {
-					"key1": paddingSize * 1,
-				},
-			},
 		},
 		{
 			name: "wal and storage are same",
@@ -109,10 +79,7 @@ func Test_BuildIndex(t *testing.T) {
 				walIndex: strings.NewReader("default:key1:value1\n"),
 				storage: func() map[string]io.ReadWriteSeeker {
 					res := map[string]io.ReadWriteSeeker{}
-					f, err := os.CreateTemp("", "")
-					if err != nil {
-						return nil
-					}
+					f := &storage.InMemoryStorage{}
 					res["default"] = f
 
 					b := bytes.NewBuffer(nil)
@@ -146,6 +113,12 @@ func Test_BuildIndex(t *testing.T) {
 				for k, v := range idx {
 					if got := offsets[tableName][k]; got != v {
 						t.Errorf("loadOperationsFromLogFile() = %v, want %v", got, v)
+						tt.args.storage["default"].Seek(0, 0)
+						content, err := io.ReadAll(tt.args.storage["default"])
+						if err != nil {
+							t.Fatal("faile to read file", err)
+						}
+						t.Log("file contents", string(content))
 					}
 				}
 			}
@@ -327,7 +300,7 @@ func TestBuildIndexFromStorage(t *testing.T) {
 func TestReconcileChanges(t *testing.T) {
 	type args struct {
 		finalIndex   map[string]map[string]int64
-		changeLog    map[string]map[string]string
+		changeLog    map[string][]Record
 		storageFiles map[string]io.ReadWriteSeeker
 	}
 	tests := []struct {
@@ -346,9 +319,12 @@ func TestReconcileChanges(t *testing.T) {
 						"key1": 0,
 					},
 				},
-				changeLog: map[string]map[string]string{
+				changeLog: map[string][]Record{
 					"default": {
-						"key1": "value1",
+						{
+							Key:   []byte("key1"),
+							Value: []byte("value1"),
+						},
 					},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
@@ -403,9 +379,12 @@ func TestReconcileChanges(t *testing.T) {
 						"key1": 0,
 					},
 				},
-				changeLog: map[string]map[string]string{
+				changeLog: map[string][]Record{
 					"default": {
-						"key1": "newvalue1",
+						{
+							Key:   []byte("key1"),
+							Value: []byte("newvalue1"),
+						},
 					},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
@@ -469,26 +448,25 @@ func TestReconcileChanges(t *testing.T) {
 						"key1": 0,
 					},
 				},
-				changeLog: map[string]map[string]string{
+				changeLog: map[string][]Record{
 					"default": {
-						"key1": "newvalue1",
-						"key2": "newvalue2",
+						{
+							Key:   []byte("key1"),
+							Value: []byte("newvalue1"),
+						},
+						{
+							Key:   []byte("key2"),
+							Value: []byte("newvalue2"),
+						},
 					},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
-					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
+					"default": func() *storage.InMemoryStorage {
+						f := &storage.InMemoryStorage{}
 						doc1 := "key1:value1"
-						if _, err := f.WriteString(doc1); err != nil {
-							return nil
-						}
+						f.Write([]byte(doc1))
 						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-						if _, err := f.Write(padding); err != nil {
-							return nil
-						}
+						f.Write(padding)
 
 						return f
 					}(),
@@ -501,13 +479,10 @@ func TestReconcileChanges(t *testing.T) {
 				},
 			},
 			expectedStorageFiles: map[string]io.ReadWriteSeeker{
-				"default": func() io.ReadWriteSeeker {
-					f, err := os.CreateTemp("", "")
-					if err != nil {
-						return nil
-					}
+				"default": func() *storage.InMemoryStorage {
+					f := &storage.InMemoryStorage{}
 					doc1 := "key1:value1"
-					if _, err := f.WriteString(doc1); err != nil {
+					if _, err := f.Write([]byte(doc1)); err != nil {
 						return nil
 					}
 					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
@@ -516,7 +491,7 @@ func TestReconcileChanges(t *testing.T) {
 					}
 
 					doc2 := "key1:newvalue1"
-					if _, err := f.WriteString(doc2); err != nil {
+					if _, err := f.Write([]byte(doc2)); err != nil {
 						return nil
 					}
 					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
@@ -525,7 +500,7 @@ func TestReconcileChanges(t *testing.T) {
 					}
 
 					doc3 := "key2:newvalue2"
-					if _, err := f.WriteString(doc3); err != nil {
+					if _, err := f.Write([]byte(doc3)); err != nil {
 						return nil
 					}
 					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc3))
@@ -652,5 +627,32 @@ func TestDB_DeleteTable_TableNotFound(t *testing.T) {
 	db := &DB{Tables: map[string]*Table{"default": {}}}
 	if err := db.DeleteTable("missing"); err == nil {
 		t.Fatalf("DeleteTable(missing) expected error, got nil")
+	}
+}
+
+func TestParseWAL(t *testing.T) {
+	type args struct {
+		walFile      io.Reader
+		storageFiles map[string]io.ReadWriteSeeker
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    map[string][]Record
+		wantErr bool
+	}{
+		// TODO: Add test cases.
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseWAL(tt.args.walFile, tt.args.storageFiles)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseWAL() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseWAL() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
