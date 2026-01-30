@@ -679,6 +679,77 @@ func TestTableLifecycle(t *testing.T) {
 	}
 }
 
+func TestSQL_Where(t *testing.T) {
+	isTbl := &Table{
+		KeyOffsets: make(map[string]int64),
+		Storage:    &MockReadWriteCloserSeeker{},
+		Schema:     InternalSchemasSchema(),
+	}
+	db := &DB{
+		LogFile: &bytes.Buffer{},
+		Tables: map[string]*Table{
+			"default":          {KeyOffsets: make(map[string]int64), Storage: &MockReadWriteCloserSeeker{}, Schema: DefaultSchema()},
+			"internal_schemas": isTbl,
+		},
+	}
+
+	schema := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnTypeString, Width: 32},
+		{Name: "name", Type: ColumnTypeString, Width: 32},
+		{Name: "grade", Type: ColumnTypeInt, Width: 8},
+	}}
+	if err := db.CreateTable("courses", &CreateTableOptions{
+		Storage: &MockReadWriteCloserSeeker{},
+		Schema:  schema,
+	}); err != nil {
+		t.Fatalf("CreateTable() error = %v", err)
+	}
+
+	// Insert records
+	for _, r := range []map[string][]byte{
+		{"id": []byte("1"), "name": []byte("math"), "grade": []byte("90")},
+		{"id": []byte("2"), "name": []byte("science"), "grade": []byte("85")},
+		{"id": []byte("3"), "name": []byte("math"), "grade": []byte("75")},
+	} {
+		if err := db.Put("courses", r); err != nil {
+			t.Fatalf("Put() error = %v", err)
+		}
+	}
+
+	// WHERE matches 2 records
+	records, err := db.SQL("SELECT * FROM courses WHERE name = 'math'")
+	if err != nil {
+		t.Fatalf("SQL() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	for _, rec := range records {
+		name := strings.TrimRight(string(rec.Columns["name"]), "\x00")
+		if name != "math" {
+			t.Errorf("expected name=math, got %q", name)
+		}
+	}
+
+	// WHERE without spaces around =
+	records, err = db.SQL("SELECT * FROM courses WHERE name='math'")
+	if err != nil {
+		t.Fatalf("SQL() error = %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records for no-space WHERE, got %d", len(records))
+	}
+
+	// WHERE matches nothing
+	records, err = db.SQL("SELECT * FROM courses WHERE name = 'history'")
+	if err != nil {
+		t.Fatalf("SQL() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 records, got %d", len(records))
+	}
+}
+
 func TestParseWAL(t *testing.T) {
 	schemas := defaultSchemas()
 

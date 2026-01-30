@@ -416,8 +416,10 @@ func (db *DB) Close() error {
 }
 
 type ScanOptions struct {
-	Limit  int
-	Offset int
+	Limit     int
+	Offset    int
+	FilterCol string // empty = no filter
+	FilterVal string
 }
 
 func (db *DB) Scan(tableName string, scanOptions ScanOptions) ([]Record, error) {
@@ -436,6 +438,12 @@ func (db *DB) Scan(tableName string, scanOptions ScanOptions) ([]Record, error) 
 			return nil, err
 		}
 		if found {
+			if scanOptions.FilterCol != "" {
+				val := strings.TrimRight(string(rec.Columns[scanOptions.FilterCol]), "\x00")
+				if val != scanOptions.FilterVal {
+					continue
+				}
+			}
 			records = append(records, rec)
 		}
 	}
@@ -555,10 +563,24 @@ func (db *DB) SQL(query string) ([]Record, error) {
 			return nil, fmt.Errorf("invalid SELECT query: %q", query)
 		}
 		table := parts[3]
-		records, err := db.Scan(table, ScanOptions{
+		opts := ScanOptions{
 			Limit:  10,
 			Offset: 0,
-		})
+		}
+		if len(parts) >= 5 && strings.ToUpper(parts[4]) == "WHERE" {
+			// Support both "col = 'val'" (3 tokens) and "col=val" / "col='val'" (1 token)
+			if len(parts) >= 8 && parts[6] == "=" {
+				opts.FilterCol = parts[5]
+				opts.FilterVal = strings.Trim(parts[7], "'")
+			} else if len(parts) >= 6 {
+				expr := parts[5]
+				if eqIdx := strings.Index(expr, "="); eqIdx > 0 {
+					opts.FilterCol = expr[:eqIdx]
+					opts.FilterVal = strings.Trim(expr[eqIdx+1:], "'")
+				}
+			}
+		}
+		records, err := db.Scan(table, opts)
 		if err != nil {
 			return nil, err
 		}
