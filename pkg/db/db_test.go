@@ -7,7 +7,6 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/igomez10/gogress/pkg/storage"
@@ -107,50 +106,129 @@ func Test_BuildIndex(t *testing.T) {
 }
 
 func TestDB_CreateTable(t *testing.T) {
-	type fields struct {
-		LogFile io.ReadWriter
-		Mutex   sync.RWMutex
-		Tables  map[string]*Table
-	}
-	type args struct {
-		tableName string
-	}
-	tests := []struct {
-		name        string
-		fields      fields
-		args        args
-		expectedErr error
-	}{
-		{
-			name: "create new table",
-			fields: fields{
-				LogFile: nil,
-				Tables:  make(map[string]*Table),
+	t.Run("create new table writes schema to internal_schemas", func(t *testing.T) {
+		isTbl := &Table{
+			KeyOffsets: make(map[string]int64),
+			Storage:    &MockReadWriteCloserSeeker{},
+			Schema:     InternalSchemasSchema(),
+		}
+		db := &DB{
+			LogFile: &bytes.Buffer{},
+			Tables: map[string]*Table{
+				"internal_schemas": isTbl,
 			},
-			args:        args{tableName: "new_table"},
-			expectedErr: nil,
-		},
-		{
-			name: "create existing table",
-			fields: fields{
-				LogFile: nil,
-				Tables:  map[string]*Table{"existing_table": {}},
-			},
-			args:        args{tableName: "existing_table"},
-			expectedErr: CreateTableAlreadyExistsError,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db := &DB{
-				LogFile: tt.fields.LogFile,
-				Mutex:   tt.fields.Mutex,
-				Tables:  tt.fields.Tables,
-			}
-			if err := db.CreateTable(tt.args.tableName, &CreateTableOptions{}); err != tt.expectedErr {
-				t.Errorf("DB.CreateTable() error = %v, expectedErr %v", err, tt.expectedErr)
-			}
+		}
+		schema := Schema{Columns: []Column{
+			{Name: "id", Type: ColumnTypeString, Width: 32},
+			{Name: "name", Type: ColumnTypeString, Width: 32},
+			{Name: "age", Type: ColumnTypeInt, Width: 8},
+		}}
+		err := db.CreateTable("students", &CreateTableOptions{
+			Storage: &MockReadWriteCloserSeeker{},
+			Schema:  schema,
 		})
+		if err != nil {
+			t.Fatalf("CreateTable() error = %v", err)
+		}
+
+		// Verify 1 record in internal_schemas (one per table)
+		if len(isTbl.KeyOffsets) != 1 {
+			t.Fatalf("expected 1 schema record, got %d", len(isTbl.KeyOffsets))
+		}
+		if _, ok := isTbl.KeyOffsets["students"]; !ok {
+			t.Errorf("missing schema record for %q", "students")
+		}
+		// Verify we can deserialize the stored schema
+		rec, found, err := isTbl.Get([]byte("students"))
+		if err != nil || !found {
+			t.Fatalf("failed to get schema record: err=%v found=%v", err, found)
+		}
+		recovered, err := deserializeSchemaString(string(rec.Columns["schema"]))
+		if err != nil {
+			t.Fatalf("deserializeSchemaString() error = %v", err)
+		}
+		if len(recovered.Columns) != 3 {
+			t.Fatalf("expected 3 columns, got %d", len(recovered.Columns))
+		}
+		if recovered.TotalWidth() != schema.TotalWidth() {
+			t.Errorf("total width mismatch: got %d, want %d", recovered.TotalWidth(), schema.TotalWidth())
+		}
+	})
+
+	t.Run("create existing table", func(t *testing.T) {
+		db := &DB{
+			Tables: map[string]*Table{"existing_table": {}},
+		}
+		if err := db.CreateTable("existing_table", &CreateTableOptions{}); err != CreateTableAlreadyExistsError {
+			t.Errorf("DB.CreateTable() error = %v, expectedErr %v", err, CreateTableAlreadyExistsError)
+		}
+	})
+}
+
+func TestDB_SchemaRecovery(t *testing.T) {
+	// Create a DB with internal_schemas, create a table, then simulate restart
+	// by building a new DB from the same storage.
+	isStorage := &MockReadWriteCloserSeeker{}
+	coursesStorage := &MockReadWriteCloserSeeker{}
+
+	isTbl := &Table{
+		KeyOffsets: make(map[string]int64),
+		Storage:    isStorage,
+		Schema:     InternalSchemasSchema(),
+	}
+	db1 := &DB{
+		LogFile: &bytes.Buffer{},
+		Tables: map[string]*Table{
+			"default":          {KeyOffsets: make(map[string]int64), Storage: &MockReadWriteCloserSeeker{}, Schema: DefaultSchema()},
+			"internal_schemas": isTbl,
+		},
+	}
+
+	schema := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnTypeString, Width: 32},
+		{Name: "name", Type: ColumnTypeString, Width: 32},
+		{Name: "createdat", Type: ColumnTypeInt, Width: 8},
+	}}
+	err := db1.CreateTable("courses", &CreateTableOptions{
+		Storage: coursesStorage,
+		Schema:  schema,
+	})
+	if err != nil {
+		t.Fatalf("CreateTable() error = %v", err)
+	}
+
+	// Now simulate recovery: read internal_schemas storage to reconstruct the schema
+	isStorage.Seek(0, io.SeekStart)
+	isIdx, err := BuildIndexFromStorage(isStorage, InternalSchemasSchema())
+	if err != nil {
+		t.Fatalf("BuildIndexFromStorage() error = %v", err)
+	}
+
+	// Reconstruct schema from the single record
+	recoveredTbl := &Table{
+		KeyOffsets: isIdx,
+		Storage:    isStorage,
+		Schema:     InternalSchemasSchema(),
+	}
+	rec, found, err := recoveredTbl.Get([]byte("courses"))
+	if err != nil || !found {
+		t.Fatalf("failed to get schema record for courses: err=%v found=%v", err, found)
+	}
+	recoveredSchema, err := deserializeSchemaString(string(rec.Columns["schema"]))
+	if err != nil {
+		t.Fatalf("deserializeSchemaString() error = %v", err)
+	}
+	if len(recoveredSchema.Columns) != 3 {
+		t.Fatalf("expected 3 columns recovered, got %d", len(recoveredSchema.Columns))
+	}
+	if recoveredSchema.TotalWidth() != schema.TotalWidth() {
+		t.Errorf("total width mismatch: got %d, want %d", recoveredSchema.TotalWidth(), schema.TotalWidth())
+	}
+	// Verify column order is preserved
+	for i, col := range schema.Columns {
+		if recoveredSchema.Columns[i].Name != col.Name {
+			t.Errorf("column %d name: got %q, want %q", i, recoveredSchema.Columns[i].Name, col.Name)
+		}
 	}
 }
 
@@ -383,6 +461,76 @@ func TestDB_DeleteTable_RemovesFileAndEntry(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected storage file to be removed, got err = %v", err)
 	}
+}
+
+func TestDB_DeleteTable_RemovesSchemaRecord(t *testing.T) {
+	isStorage := &MockReadWriteCloserSeeker{}
+	isTbl := &Table{
+		KeyOffsets: make(map[string]int64),
+		Storage:    isStorage,
+		Schema:     InternalSchemasSchema(),
+	}
+	db := &DB{
+		LogFile: &bytes.Buffer{},
+		Tables: map[string]*Table{
+			"default":          {KeyOffsets: make(map[string]int64), Storage: &MockReadWriteCloserSeeker{}, Schema: DefaultSchema()},
+			"internal_schemas": isTbl,
+		},
+	}
+
+	// Create a table so its schema is persisted
+	fooStorage, _ := os.CreateTemp("", "foo-*")
+	fooPath := fooStorage.Name()
+	schema := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnTypeString, Width: 32},
+		{Name: "val", Type: ColumnTypeString, Width: 32},
+	}}
+	if err := db.CreateTable("foo", &CreateTableOptions{Storage: fooStorage, Schema: schema}); err != nil {
+		t.Fatalf("CreateTable() error = %v", err)
+	}
+	if _, ok := isTbl.KeyOffsets["foo"]; !ok {
+		t.Fatalf("expected schema record for foo after create")
+	}
+
+	// Delete the table
+	if err := db.DeleteTable("foo"); err != nil {
+		t.Fatalf("DeleteTable() error = %v", err)
+	}
+
+	// Schema record should be removed from in-memory index
+	if _, ok := isTbl.KeyOffsets["foo"]; ok {
+		t.Fatalf("schema record for foo should be removed after delete")
+	}
+
+	// Simulate recovery: rebuild index from internal_schemas storage
+	// The tombstone should cause the schema to be skipped
+	isStorage.Seek(0, io.SeekStart)
+	isIdx, err := BuildIndexFromStorage(isStorage, InternalSchemasSchema())
+	if err != nil {
+		t.Fatalf("BuildIndexFromStorage() error = %v", err)
+	}
+	recoveredTbl := &Table{
+		KeyOffsets: isIdx,
+		Storage:    isStorage,
+		Schema:     InternalSchemasSchema(),
+	}
+	// The latest record for "foo" should have an empty schema (tombstone)
+	if _, ok := isIdx["foo"]; ok {
+		rec, found, err := recoveredTbl.Get([]byte("foo"))
+		if err != nil || !found {
+			t.Fatalf("failed to read tombstone record")
+		}
+		schemaStr := string(bytes.TrimRight(rec.Columns["schema"], "\x00"))
+		if schemaStr != "" {
+			t.Fatalf("expected empty schema (tombstone), got %q", schemaStr)
+		}
+		// deserializeSchemaString should fail on empty string
+		if _, err := deserializeSchemaString(schemaStr); err == nil {
+			t.Fatalf("expected error deserializing empty schema")
+		}
+	}
+
+	os.Remove(fooPath)
 }
 
 func TestDB_DeleteTable_TableNotFound(t *testing.T) {

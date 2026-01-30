@@ -31,6 +31,56 @@ func initializeStorage(storageName string) (ReadWriteCloserSeeker, error) {
 	return f, nil
 }
 
+// InternalSchemasSchema returns the hardcoded schema for the internal_schemas table.
+// Each record stores one table's full schema: id=tablename, schema="col:type:width,..."
+func InternalSchemasSchema() Schema {
+	return Schema{
+		Columns: []Column{
+			{Name: "id", Type: ColumnTypeString, Width: 32},
+			{Name: "schema", Type: ColumnTypeString, Width: 96},
+		},
+	}
+}
+
+// serializeSchemaString encodes a Schema as "col:type:width,col:type:width,..."
+func serializeSchemaString(schema Schema) string {
+	parts := make([]string, len(schema.Columns))
+	for i, col := range schema.Columns {
+		typeName := "string"
+		if col.Type == ColumnTypeInt {
+			typeName = "int"
+		}
+		parts[i] = fmt.Sprintf("%s:%s:%d", col.Name, typeName, col.Width)
+	}
+	return strings.Join(parts, ",")
+}
+
+// deserializeSchemaString decodes "col:type:width,col:type:width,..." into a Schema.
+func deserializeSchemaString(s string) (Schema, error) {
+	s = strings.TrimRight(s, "\x00")
+	if s == "" {
+		return Schema{}, fmt.Errorf("empty schema string")
+	}
+	parts := strings.Split(s, ",")
+	columns := make([]Column, 0, len(parts))
+	for _, part := range parts {
+		fields := strings.SplitN(part, ":", 3)
+		if len(fields) != 3 {
+			return Schema{}, fmt.Errorf("invalid schema part: %q", part)
+		}
+		width, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return Schema{}, fmt.Errorf("invalid width in schema part %q: %w", part, err)
+		}
+		colType := ColumnTypeString
+		if fields[1] == "int" {
+			colType = ColumnTypeInt
+		}
+		columns = append(columns, Column{Name: fields[0], Type: colType, Width: width})
+	}
+	return Schema{Columns: columns}, nil
+}
+
 func NewDB(opts NewDBOptions) (*DB, error) {
 	db := &DB{
 		LogFile: opts.LogFile,
@@ -44,7 +94,6 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 	}
 
 	if db.Tables["default"].Storage == nil {
-		// create but not truncate
 		f, err := initializeStorage("default")
 		if err != nil {
 			return nil, err
@@ -52,11 +101,24 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 		db.Tables["default"].Storage = f
 	}
 
+	// create internal_schemas table
+	db.Tables["internal_schemas"] = &Table{
+		KeyOffsets: make(map[string]int64),
+		Schema:     InternalSchemasSchema(),
+	}
+	{
+		f, err := initializeStorage("internal_schemas")
+		if err != nil {
+			return nil, err
+		}
+		db.Tables["internal_schemas"].Storage = f
+	}
+
 	if db.LogFile == nil {
 		db.LogFile = os.Stdout
 	}
 
-	// load index from file
+	// Discover storage files
 	tables := findTables(storagePrefix)
 	storageFiles := map[string]io.ReadWriteSeeker{}
 	for _, table := range tables {
@@ -64,15 +126,44 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 		tableName := splitted[len(splitted)-1]
 		storageFiles[tableName] = table
 		if db.Tables[tableName] == nil {
+			// Placeholder; schema will be filled from internal_schemas below
 			db.Tables[tableName] = &Table{
 				KeyOffsets: make(map[string]int64),
 				Storage:    table,
-				Schema:     loadSchema(tableName),
+				Schema:     DefaultSchema(),
 			}
 		}
 	}
 
-	// Build schemas map for BuildIndex
+	// Build index for internal_schemas first so we can read it
+	isSchema := InternalSchemasSchema()
+	if sf, ok := storageFiles["internal_schemas"]; ok {
+		isIdx, err := BuildIndexFromStorage(sf, isSchema)
+		if err != nil {
+			isIdx = map[string]int64{}
+		}
+		db.Tables["internal_schemas"].KeyOffsets = isIdx
+	}
+
+	// Read all records from internal_schemas to reconstruct schemas
+	isTbl := db.Tables["internal_schemas"]
+	for key := range isTbl.KeyOffsets {
+		rec, found, err := isTbl.Get([]byte(key))
+		if err != nil || !found {
+			continue
+		}
+		tblName := string(bytes.TrimRight(rec.Columns["id"], "\x00"))
+		schemaStr := string(bytes.TrimRight(rec.Columns["schema"], "\x00"))
+		schema, err := deserializeSchemaString(schemaStr)
+		if err != nil {
+			continue
+		}
+		if tbl, ok := db.Tables[tblName]; ok {
+			tbl.Schema = schema
+		}
+	}
+
+	// Build schemas map for full BuildIndex
 	schemas := map[string]Schema{}
 	for name, tbl := range db.Tables {
 		schemas[name] = tbl.Schema
@@ -97,7 +188,7 @@ func findTables(storagePrefix string) []*os.File {
 		return nil
 	}
 	for _, file := range files {
-		if file.IsDir() || file.Name() == ".DS_Store" || strings.HasSuffix(file.Name(), ".schema") {
+		if file.IsDir() || file.Name() == ".DS_Store" {
 			continue
 		}
 		f, err := os.OpenFile(storagePrefix+file.Name(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -110,56 +201,6 @@ func findTables(storagePrefix string) []*os.File {
 }
 
 var InvalidLogLineError = errors.New("invalid log line")
-
-// schemaFilePath returns the path to the schema file for a table.
-func schemaFilePath(tableName string) string {
-	return storagePrefix + tableName + ".schema"
-}
-
-// saveSchema writes a schema to disk in the format: name:type:width per line.
-func saveSchema(tableName string, schema Schema) error {
-	var b strings.Builder
-	for _, col := range schema.Columns {
-		typeName := "string"
-		if col.Type == ColumnTypeInt {
-			typeName = "int"
-		}
-		fmt.Fprintf(&b, "%s:%s:%d\n", col.Name, typeName, col.Width)
-	}
-	return os.WriteFile(schemaFilePath(tableName), []byte(b.String()), 0666)
-}
-
-// loadSchema reads a schema from disk. Returns DefaultSchema if file doesn't exist.
-func loadSchema(tableName string) Schema {
-	data, err := os.ReadFile(schemaFilePath(tableName))
-	if err != nil {
-		return DefaultSchema()
-	}
-
-	var columns []Column
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) != 3 {
-			return DefaultSchema()
-		}
-		width, err := strconv.Atoi(parts[2])
-		if err != nil {
-			return DefaultSchema()
-		}
-		colType := ColumnTypeString
-		if parts[1] == "int" {
-			colType = ColumnTypeInt
-		}
-		columns = append(columns, Column{Name: parts[0], Type: colType, Width: width})
-	}
-	if len(columns) == 0 {
-		return DefaultSchema()
-	}
-	return Schema{Columns: columns}
-}
 
 // BuildIndex rebuilds the in-memory index from storage files and WAL.
 func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker, schemas map[string]Schema) (map[string]map[string]int64, error) {
@@ -479,9 +520,21 @@ func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
 			return err
 		}
 		db.Tables[tableName].Storage = f
+	}
 
-		// Persist schema to disk
-		if err := saveSchema(tableName, schema); err != nil {
+	// Persist schema to internal_schemas (one record per table)
+	if isTbl, ok := db.Tables["internal_schemas"]; ok {
+		colValues := map[string][]byte{
+			"id":     []byte(tableName),
+			"schema": []byte(serializeSchemaString(schema)),
+		}
+		if err := isTbl.Put(colValues, func() {
+			parts := []string{"internal_schemas"}
+			for _, c := range isTbl.Schema.Columns {
+				parts = append(parts, string(colValues[c.Name]))
+			}
+			fmt.Fprintln(db.LogFile, strings.Join(parts, ":"))
+		}); err != nil {
 			return err
 		}
 	}
@@ -552,8 +605,18 @@ func (db *DB) DeleteTable(tableName string) error {
 		}
 	}
 
-	// Remove schema file if it exists
-	os.Remove(schemaFilePath(tableName))
+	// Remove schema record from internal_schemas by writing a tombstone
+	if isTbl, ok := db.Tables["internal_schemas"]; ok {
+		colValues := map[string][]byte{
+			"id":     []byte(tableName),
+			"schema": []byte(""),
+		}
+		_ = isTbl.Put(colValues, func() {
+			parts := []string{"internal_schemas", tableName, ""}
+			fmt.Fprintln(db.LogFile, strings.Join(parts, ":"))
+		})
+		delete(isTbl.KeyOffsets, tableName)
+	}
 
 	delete(db.Tables, tableName)
 	return nil
