@@ -25,6 +25,10 @@ hammer
 # run a simple SQL query (experimental)
 gogress-cli sql "select * from products"
 sku123: hammer
+
+# filter with a WHERE clause
+gogress-cli sql "select * from products where id='sku123'"
+sku123: hammer
 ```
 
 ## Project Structure
@@ -102,8 +106,10 @@ Examples of operations include:
 You can run a very small subset of SQL via the CLI or directly from Go. Currently supported:
 
 - SELECT with a FROM clause: `select * from <table>`
-  - The query is tokenized by whitespace; the table name is read from the token after `from`.
-  - Returns up to 10 records by default; filters, ordering, projections, and joins are not supported yet.
+  - Returns up to 10 records by default.
+- WHERE clause for equality filtering: `select * from <table> where <col> = '<value>'`
+  - Supports both spaced (`col = 'val'`) and compact (`col=val`) syntax.
+  - Ordering, projections, and joins are not supported yet.
 
 CLI example:
 
@@ -140,7 +146,7 @@ for _, r := range records {
   - Put: `gogress-cli put <table> <key> <value>`
   - Get: `gogress-cli get <table> <key>`
   - Scan: `gogress-cli scan <table> [--limit N] [--offset N]`
-  - SQL (experimental): `gogress-cli sql "select * from <table>"`
+  - SQL (experimental): `gogress-cli sql "select * from <table> [where col='val']"`
 
 ## Contributing
 
