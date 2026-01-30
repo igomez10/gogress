@@ -10,54 +10,56 @@ import (
 )
 
 func TestBasicPutGet(t *testing.T) {
-	// try to remove /tmp/db-
-	db, err := db.NewDB(db.NewDBOptions{})
+	d, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	key := []byte("key1")
-	val := []byte("value1")
-	if err := db.Tables["default"].Put(key, val, func() {}); err != nil {
+	colValues := map[string][]byte{
+		"key":   []byte("key1"),
+		"value": []byte("value1"),
+	}
+	if err := d.Tables["default"].Put(colValues, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err := db.Tables["default"].Get(key)
+	got, ok, err := d.Tables["default"].Get([]byte("key1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
 		t.Fatal("expected value to be found")
 	}
-	if !bytes.Equal(got, val) {
-		t.Fatalf("expected %q, got %q", val, got)
+	if !bytes.Equal(got.Columns["value"], []byte("value1")) {
+		t.Fatalf("expected %q, got %q", "value1", got.Columns["value"])
 	}
 }
 
 func TestPut(t *testing.T) {
-	db, err := db.NewDB(db.NewDBOptions{})
+	d, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	key := []byte("key1")
-	val := []byte("value1")
-	if err := db.Tables["default"].Put(key, val, func() {}); err != nil {
+	colValues := map[string][]byte{
+		"key":   []byte("key1"),
+		"value": []byte("value1"),
+	}
+	if err := d.Tables["default"].Put(colValues, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
-	f := db.Tables["default"].Storage
+	f := d.Tables["default"].Storage
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 
-	// check that value was written
-	content, err := io.ReadAll(db.Tables["default"].Storage)
+	content, err := io.ReadAll(d.Tables["default"].Storage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(content, val) {
-		t.Fatalf("expected %q to be in %q", val, content)
+	if !bytes.Contains(content, []byte("value1")) {
+		t.Fatalf("expected %q to be in %q", "value1", content)
 	}
 }
 
@@ -75,7 +77,6 @@ func TestWriteToFile(t *testing.T) {
 	if err := f.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	// Verify that the record was written correctly
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
@@ -89,41 +90,45 @@ func TestWriteToFile(t *testing.T) {
 }
 
 func TestOverWriteExistingKey(t *testing.T) {
-	db, err := db.NewDB(db.NewDBOptions{})
+	d, err := db.NewDB(db.NewDBOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	key := []byte("key1")
-	val1 := []byte("value1")
-	if err := db.Tables["default"].Put(key, val1, func() {}); err != nil {
+	colValues1 := map[string][]byte{
+		"key":   []byte("key1"),
+		"value": []byte("value1"),
+	}
+	if err := d.Tables["default"].Put(colValues1, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
-	val2 := []byte("value2")
-	if err := db.Tables["default"].Put(key, val2, func() {}); err != nil {
+	colValues2 := map[string][]byte{
+		"key":   []byte("key1"),
+		"value": []byte("value2"),
+	}
+	if err := d.Tables["default"].Put(colValues2, func() {}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err := db.Tables["default"].Get(key)
+	got, ok, err := d.Tables["default"].Get([]byte("key1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
 		t.Fatal("expected value to be found")
 	}
-	if !bytes.Equal(got, val2) {
-		t.Fatalf("expected %q, got %q", val2, got)
+	if !bytes.Equal(got.Columns["value"], []byte("value2")) {
+		t.Fatalf("expected %q, got %q", "value2", got.Columns["value"])
 	}
-	// expect to contain first value too in underlying file
-	if _, err := db.Tables["default"].Storage.Seek(0, io.SeekStart); err != nil {
+	if _, err := d.Tables["default"].Storage.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	content, err := io.ReadAll(db.Tables["default"].Storage)
+	content, err := io.ReadAll(d.Tables["default"].Storage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(content, val1) {
-		t.Fatalf("expected %q to be in %q", val1, content)
+	if !bytes.Contains(content, []byte("value1")) {
+		t.Fatalf("expected %q to be in %q", "value1", content)
 	}
 }

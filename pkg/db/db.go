@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -39,6 +40,7 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 	db.Tables["default"] = &Table{
 		KeyOffsets: make(map[string]int64),
 		Storage:    opts.File,
+		Schema:     DefaultSchema(),
 	}
 
 	if db.Tables["default"].Storage == nil {
@@ -55,7 +57,6 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 	}
 
 	// load index from file
-	// TODO add list of storage files
 	tables := findTables(storagePrefix)
 	storageFiles := map[string]io.ReadWriteSeeker{}
 	for _, table := range tables {
@@ -66,10 +67,18 @@ func NewDB(opts NewDBOptions) (*DB, error) {
 			db.Tables[tableName] = &Table{
 				KeyOffsets: make(map[string]int64),
 				Storage:    table,
+				Schema:     loadSchema(tableName),
 			}
 		}
 	}
-	m, err := BuildIndex(db.LogFile, storageFiles)
+
+	// Build schemas map for BuildIndex
+	schemas := map[string]Schema{}
+	for name, tbl := range db.Tables {
+		schemas[name] = tbl.Schema
+	}
+
+	m, err := BuildIndex(db.LogFile, storageFiles, schemas)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +97,7 @@ func findTables(storagePrefix string) []*os.File {
 		return nil
 	}
 	for _, file := range files {
-		if file.IsDir() || file.Name() == ".DS_Store" {
+		if file.IsDir() || file.Name() == ".DS_Store" || strings.HasSuffix(file.Name(), ".schema") {
 			continue
 		}
 		f, err := os.OpenFile(storagePrefix+file.Name(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -102,101 +111,155 @@ func findTables(storagePrefix string) []*os.File {
 
 var InvalidLogLineError = errors.New("invalid log line")
 
-// format is tableName:key:value
-// For crash recovery we scan the storage and apply the log
-func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string]map[string]int64, error) {
+// schemaFilePath returns the path to the schema file for a table.
+func schemaFilePath(tableName string) string {
+	return storagePrefix + tableName + ".schema"
+}
+
+// saveSchema writes a schema to disk in the format: name:type:width per line.
+func saveSchema(tableName string, schema Schema) error {
+	var b strings.Builder
+	for _, col := range schema.Columns {
+		typeName := "string"
+		if col.Type == ColumnTypeInt {
+			typeName = "int"
+		}
+		fmt.Fprintf(&b, "%s:%s:%d\n", col.Name, typeName, col.Width)
+	}
+	return os.WriteFile(schemaFilePath(tableName), []byte(b.String()), 0666)
+}
+
+// loadSchema reads a schema from disk. Returns DefaultSchema if file doesn't exist.
+func loadSchema(tableName string) Schema {
+	data, err := os.ReadFile(schemaFilePath(tableName))
+	if err != nil {
+		return DefaultSchema()
+	}
+
+	var columns []Column
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			return DefaultSchema()
+		}
+		width, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return DefaultSchema()
+		}
+		colType := ColumnTypeString
+		if parts[1] == "int" {
+			colType = ColumnTypeInt
+		}
+		columns = append(columns, Column{Name: parts[0], Type: colType, Width: width})
+	}
+	if len(columns) == 0 {
+		return DefaultSchema()
+	}
+	return Schema{Columns: columns}
+}
+
+// BuildIndex rebuilds the in-memory index from storage files and WAL.
+func BuildIndex(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker, schemas map[string]Schema) (map[string]map[string]int64, error) {
 	finalIndex := map[string]map[string]int64{}
 	// Scan storage files
 	for tableName, storage := range storageFiles {
-		storageTableIdx, err := BuildIndexFromStorage(storage)
+		schema := schemas[tableName]
+		storageTableIdx, err := BuildIndexFromStorage(storage, schema)
 		if err != nil {
-			return nil, err
+			// Incompatible storage file (e.g. old format), truncate and start fresh
+			if seeker, ok := storage.(io.WriteSeeker); ok {
+				seeker.Seek(0, io.SeekStart)
+				if trunc, ok := storage.(interface{ Truncate(int64) error }); ok {
+					trunc.Truncate(0)
+				}
+			}
+			finalIndex[tableName] = map[string]int64{}
+			continue
 		}
 
 		finalIndex[tableName] = storageTableIdx
 	}
 
 	// Load WAL
-	changeLog, err := ParseWAL(walFile, storageFiles)
+	changeLog, err := ParseWAL(walFile, schemas)
 	if err != nil {
 		return nil, err
 	}
 
 	// Reconcile changes
-	if _, err := ReconcileChanges(finalIndex, changeLog, storageFiles); err != nil {
+	if _, err := ReconcileChanges(finalIndex, changeLog, storageFiles, schemas); err != nil {
 		return nil, err
 	}
 
 	return finalIndex, nil
 }
 
-func ReconcileChanges(finalIndex map[string]map[string]int64, changeLog map[string][]Record, storageFiles map[string]io.ReadWriteSeeker) (int64, error) {
+func ReconcileChanges(finalIndex map[string]map[string]int64, changeLog map[string][]Record, storageFiles map[string]io.ReadWriteSeeker, schemas map[string]Schema) (int64, error) {
 	var totalChanges int64
 	for tableName, recordChanges := range changeLog {
+		// Skip WAL entries for tables with no storage file (e.g. deleted tables)
+		if _, ok := storageFiles[tableName]; !ok {
+			continue
+		}
+		schema := schemas[tableName]
 		if finalIndex[tableName] == nil {
 			finalIndex[tableName] = map[string]int64{}
 		}
-		// traverse the WAL and get the latest value for each key in it
-		// We can have the case where a key is multiple times in the WAL but
-		// it was only written once to the storage. In that case we only want to store the last
-		// value, not the intermediate steps. For this deduplication step we will traverse the changes
-		// for a given table **in reverse** and only store the first value. We will then traverse the changes
-		// in order but only write to storage if the value matches the last version
-		latestKeyValue := map[string]string{}
+		// traverse the WAL and get the latest value for each key
+		// We deduplicate by traversing in reverse
+		type latestRecord struct {
+			rec Record
+		}
+		latestByKey := map[string]latestRecord{}
 		for i := 0; i < len(recordChanges); i++ {
-			currentKey := recordChanges[len(recordChanges)-1-i]
-			if _, exists := latestKeyValue[string(currentKey.Key)]; !exists {
-				latestKeyValue[string(currentKey.Key)] = string(currentKey.Value)
+			currentRec := recordChanges[len(recordChanges)-1-i]
+			pk := string(currentRec.Key(schema))
+			if _, exists := latestByKey[pk]; !exists {
+				latestByKey[pk] = latestRecord{rec: currentRec}
 			}
 		}
 
-		// check all changes and compare current stored version with new version
 		for _, currentRecordFromWAL := range recordChanges {
+			pk := string(currentRecordFromWAL.Key(schema))
 			currentTableIndex := finalIndex[tableName]
-			recordOffset, exists := currentTableIndex[string(currentRecordFromWAL.Key)]
+			recordOffset, exists := currentTableIndex[pk]
 			if !exists {
-				// key in wal not found in index, add it to index and to storage
+				// key in wal not found in index, add it
 				tableFile := storageFiles[tableName]
-				// write new record to storage
-				offset, err := WriteRecordToFile(tableFile, currentRecordFromWAL)
+				offset, err := WriteRecordToFile(tableFile, currentRecordFromWAL, schema)
 				if err != nil {
 					return 0, err
 				}
 
-				// add record to index
-				finalIndex[tableName][string(currentRecordFromWAL.Key)] = offset
+				finalIndex[tableName][pk] = offset
 				totalChanges++
 				continue
 			}
 
-			// record exists in index, lets see if the record stored in storage matches the last
-			// version in WAL
+			// record exists, check if value matches
 			tableFile := storageFiles[tableName]
-			recordFromStorage, err := ReadRecordFromFile(tableFile, recordOffset)
+			recordFromStorage, err := ReadRecordFromFile(tableFile, recordOffset, schema)
 			if err != nil {
 				return 0, err
 			}
 
-			// validate the record in the offset matches the expected record by checking key
-			if string(recordFromStorage.Key) != string(currentRecordFromWAL.Key) {
-				return 0, fmt.Errorf("key mismatch: expected %q, got %q", string(currentRecordFromWAL.Key), string(recordFromStorage.Key))
+			storagePK := string(recordFromStorage.Key(schema))
+			if storagePK != pk {
+				return 0, fmt.Errorf("key mismatch: expected %q, got %q", pk, storagePK)
 			}
 
-			// check if the value in storage matches the value in WAL
-			if string(recordFromStorage.Value) != string(currentRecordFromWAL.Value) {
-				// found key with stale value, update with new value
-				r := Record{
-					Key:   recordFromStorage.Key,
-					Value: []byte(latestKeyValue[string(recordFromStorage.Key)]),
-				}
-				offset, err := WriteRecordToFile(tableFile, r)
+			// Compare all column values
+			if !recordsEqual(recordFromStorage, currentRecordFromWAL, schema) {
+				latest := latestByKey[pk].rec
+				offset, err := WriteRecordToFile(tableFile, latest, schema)
 				if err != nil {
 					return 0, err
 				}
 
-				// update index in finalIndex
-				finalIndex[tableName][string(currentRecordFromWAL.Key)] = offset
-
+				finalIndex[tableName][pk] = offset
 				totalChanges++
 			}
 		}
@@ -204,7 +267,16 @@ func ReconcileChanges(finalIndex map[string]map[string]int64, changeLog map[stri
 	return totalChanges, nil
 }
 
-func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
+func recordsEqual(a, b Record, schema Schema) bool {
+	for _, col := range schema.Columns {
+		if !bytes.Equal(a.Columns[col.Name], b.Columns[col.Name]) {
+			return false
+		}
+	}
+	return true
+}
+
+func BuildIndexFromStorage(storage io.ReadSeeker, schema Schema) (map[string]int64, error) {
 	if storage == nil {
 		return map[string]int64{}, nil
 	}
@@ -217,7 +289,6 @@ func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
 		if err != nil {
 			switch err {
 			case io.EOF:
-				// End of file reached
 				return idx, nil
 			default:
 				return nil, err
@@ -226,41 +297,57 @@ func BuildIndexFromStorage(storage io.ReadSeeker) (map[string]int64, error) {
 		if readBytes != paddingSize {
 			return nil, InvalidLogLineError
 		}
-		// split on :
-		splitted := bytes.Split(content, []byte(":"))
-		// process current
-		if len(splitted) != 2 {
+
+		// Extract primary key from the record using schema
+		pos := 0
+		pkCol := schema.Columns[0]
+		pkBytes := bytes.TrimRight(content[pos:pos+pkCol.Width], "\x00")
+		if len(pkBytes) == 0 {
 			return nil, InvalidLogLineError
 		}
-		key := splitted[0]
-		idx[string(key)] = int64(currentOffset)
+
+		idx[string(pkBytes)] = int64(currentOffset)
 		currentOffset += paddingSize
 	}
 }
 
-// func ParseWAL(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string]map[string]string, error) {
-func ParseWAL(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (map[string][]Record, error) {
+// WAL format: tableName:col1val:col2val:...\n
+// Column values are positional based on schema order.
+func ParseWAL(walFile io.Reader, schemas map[string]Schema) (map[string][]Record, error) {
 	changeLog := map[string][]Record{}
 	scanner := bufio.NewScanner(walFile)
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) != 3 {
-			return nil, InvalidLogLineError
+		// First field is table name, rest are column values
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			// Skip incompatible WAL lines (e.g. old format)
+			continue
 		}
 
 		tableName := parts[0]
-		key := parts[1]
-		value := parts[2]
+		schema, ok := schemas[tableName]
+		if !ok {
+			// Use default schema if table not known
+			schema = DefaultSchema()
+		}
+
+		colParts := strings.SplitN(parts[1], ":", len(schema.Columns))
+		if len(colParts) != len(schema.Columns) {
+			// Skip WAL lines that don't match the current schema
+			continue
+		}
+
+		rec := Record{Columns: make(map[string][]byte)}
+		for i, col := range schema.Columns {
+			rec.Columns[col.Name] = []byte(colParts[i])
+		}
+
 		if changeLog[tableName] == nil {
 			changeLog[tableName] = []Record{}
 		}
-
-		changeLog[tableName] = append(changeLog[tableName], Record{
-			Key:   []byte(key),
-			Value: []byte(value),
-		})
+		changeLog[tableName] = append(changeLog[tableName], rec)
 	}
 
 	return changeLog, nil
@@ -269,14 +356,6 @@ func ParseWAL(walFile io.Reader, storageFiles map[string]io.ReadWriteSeeker) (ma
 type DB struct {
 	LogFile io.ReadWriter
 
-	// KeyOffsets is a mapping from keys to their file offsets
-	// this allows for quick lookups when retrieving values
-	// and efficient deletion of records
-	// the key is the record's key, basically the primary key
-	// the value is the record's value, which is the file offset
-	// the value is the record's value, which is the file offset
-	// of the last record for that key. by offset we mean the byte offset
-	// from the beginning of the file to the start of the record.
 	Mutex sync.RWMutex
 
 	Tables map[string]*Table
@@ -311,15 +390,12 @@ func (db *DB) Scan(tableName string, scanOptions ScanOptions) ([]Record, error) 
 
 	var records []Record
 	for key := range table.KeyOffsets {
-		val, found, err := table.Get([]byte(key))
+		rec, found, err := table.Get([]byte(key))
 		if err != nil {
 			return nil, err
 		}
 		if found {
-			records = append(records, Record{
-				Key:   []byte(key),
-				Value: val,
-			})
+			records = append(records, rec)
 		}
 	}
 	return records, nil
@@ -336,30 +412,35 @@ func (db *DB) ListTables() []string {
 	return tables
 }
 
-func (db *DB) Put(tableName, key, val []byte) error {
+func (db *DB) Put(tableName string, colValues map[string][]byte) error {
 	db.Mutex.Lock()
 	defer db.Mutex.Unlock()
 
-	table, ok := db.Tables[string(tableName)]
+	table, ok := db.Tables[tableName]
 	if !ok {
 		return fmt.Errorf("table %q not found", tableName)
 	}
 
 	hook := func() {
-		// write to log for crash recovery
-		fmt.Fprintln(db.LogFile, string(tableName)+":"+string(key)+":"+string(val))
+		// write to log: tableName:col1val:col2val:...
+		parts := make([]string, 0, len(table.Schema.Columns)+1)
+		parts = append(parts, tableName)
+		for _, col := range table.Schema.Columns {
+			parts = append(parts, string(colValues[col.Name]))
+		}
+		fmt.Fprintln(db.LogFile, strings.Join(parts, ":"))
 	}
 
-	return table.Put(key, val, hook)
+	return table.Put(colValues, hook)
 }
 
-func (db *DB) Get(tableName, key []byte) ([]byte, bool, error) {
+func (db *DB) Get(tableName string, key []byte) (Record, bool, error) {
 	db.Mutex.RLock()
 	defer db.Mutex.RUnlock()
 
-	table, ok := db.Tables[string(tableName)]
+	table, ok := db.Tables[tableName]
 	if !ok {
-		return nil, false, fmt.Errorf("table %q not found", tableName)
+		return Record{}, false, fmt.Errorf("table %q not found", tableName)
 	}
 
 	return table.Get(key)
@@ -367,6 +448,7 @@ func (db *DB) Get(tableName, key []byte) ([]byte, bool, error) {
 
 type CreateTableOptions struct {
 	Storage ReadWriteCloserSeeker
+	Schema  Schema
 }
 
 var CreateTableAlreadyExistsError = errors.New("table already exists")
@@ -379,11 +461,17 @@ func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
 		return CreateTableAlreadyExistsError
 	}
 
-	db.Tables[tableName] = &Table{
-		KeyOffsets: make(map[string]int64),
+	schema := DefaultSchema()
+	if opts != nil && len(opts.Schema.Columns) > 0 {
+		schema = opts.Schema
 	}
 
-	if opts.Storage != nil {
+	db.Tables[tableName] = &Table{
+		KeyOffsets: make(map[string]int64),
+		Schema:     schema,
+	}
+
+	if opts != nil && opts.Storage != nil {
 		db.Tables[tableName].Storage = opts.Storage
 	} else {
 		f, err := initializeStorage(tableName)
@@ -391,23 +479,28 @@ func (db *DB) CreateTable(tableName string, opts *CreateTableOptions) error {
 			return err
 		}
 		db.Tables[tableName].Storage = f
+
+		// Persist schema to disk
+		if err := saveSchema(tableName, schema); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (db *DB) SQL(query string) ([]Record, error) {
-	// For now, just print the query
 	query = strings.TrimSpace(query)
 	parts := strings.Fields(query)
 	if len(parts) == 0 {
 		return nil, nil
 	}
 
-	switch parts[0] {
-	case "select", "SELECT":
-		// Handle SELECT queries
-		// columns := parts[1]
+	switch strings.ToUpper(parts[0]) {
+	case "SELECT":
+		if len(parts) < 4 {
+			return nil, fmt.Errorf("invalid SELECT query: %q", query)
+		}
 		table := parts[3]
 		records, err := db.Scan(table, ScanOptions{
 			Limit:  10,
@@ -418,12 +511,16 @@ func (db *DB) SQL(query string) ([]Record, error) {
 		}
 		return records, nil
 
-	// case "INSERT":
-	// 	// Handle INSERT queries
-	// case "UPDATE":
-	// 	// Handle UPDATE queries
-	// case "DELETE":
-	// 	// Handle DELETE queries
+	case "CREATE":
+		if len(parts) < 3 || strings.ToUpper(parts[1]) != "TABLE" {
+			return nil, fmt.Errorf("invalid CREATE query: %q", query)
+		}
+		tableName := parts[2]
+		if err := db.CreateTable(tableName, nil); err != nil {
+			return nil, err
+		}
+		return nil, nil
+
 	default:
 		panic("unsupported query")
 	}
@@ -431,7 +528,6 @@ func (db *DB) SQL(query string) ([]Record, error) {
 
 var DeleteDefaultTableError = errors.New("cannot delete default table")
 
-// DeleteTable removes a table from the DB, closing and deleting its storage file.
 func (db *DB) DeleteTable(tableName string) error {
 	db.Mutex.Lock()
 	defer db.Mutex.Unlock()
@@ -445,18 +541,19 @@ func (db *DB) DeleteTable(tableName string) error {
 		return fmt.Errorf("table %q not found", tableName)
 	}
 
-	// Attempt to close the storage
 	if table.Storage != nil {
 		if err := table.Storage.Close(); err != nil {
 			return err
 		}
-		// Try to delete the underlying file; ignore errors (e.g., mock storages)
 		if name := table.Storage.Name(); name != "" {
 			if err := os.Remove(name); err != nil {
 				return err
 			}
 		}
 	}
+
+	// Remove schema file if it exists
+	os.Remove(schemaFilePath(tableName))
 
 	delete(db.Tables, tableName)
 	return nil

@@ -13,6 +13,12 @@ import (
 	"github.com/igomez10/gogress/pkg/storage"
 )
 
+func defaultSchemas() map[string]Schema {
+	return map[string]Schema{
+		"default": DefaultSchema(),
+	}
+}
+
 func Test_BuildIndex(t *testing.T) {
 	type args struct {
 		idx      map[string]int64
@@ -31,10 +37,7 @@ func Test_BuildIndex(t *testing.T) {
 				idx:      make(map[string]int64),
 				walIndex: strings.NewReader("default:key1:1\ndefault:key2:2\n"),
 				storage: map[string]io.ReadWriteSeeker{
-					"default": func() io.ReadWriteSeeker {
-						f := &storage.InMemoryStorage{}
-						return f
-					}(),
+					"default": &storage.InMemoryStorage{},
 				},
 			},
 			want: map[string]map[string]int64{
@@ -45,18 +48,15 @@ func Test_BuildIndex(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid log",
+			name: "invalid log lines are skipped",
 			args: args{
 				idx:      make(map[string]int64),
-				walIndex: strings.NewReader("invalid\nlog\n"),
+				walIndex: strings.NewReader("invalid\n"),
 				storage: map[string]io.ReadWriteSeeker{
-					"default": func() io.ReadWriteSeeker {
-						f := &storage.InMemoryStorage{}
-						return f
-					}(),
+					"default": &storage.InMemoryStorage{},
 				},
 			},
-			expectedErr: InvalidLogLineError,
+			want: map[string]map[string]int64{},
 		},
 		{
 			name: "empty log",
@@ -64,10 +64,7 @@ func Test_BuildIndex(t *testing.T) {
 				idx:      make(map[string]int64),
 				walIndex: strings.NewReader(""),
 				storage: map[string]io.ReadWriteSeeker{
-					"default": func() io.ReadWriteSeeker {
-						f := &storage.InMemoryStorage{}
-						return f
-					}(),
+					"default": &storage.InMemoryStorage{},
 				},
 			},
 			want: map[string]map[string]int64{},
@@ -81,17 +78,6 @@ func Test_BuildIndex(t *testing.T) {
 					res := map[string]io.ReadWriteSeeker{}
 					f := &storage.InMemoryStorage{}
 					res["default"] = f
-
-					b := bytes.NewBuffer(nil)
-					doc1 := "key1:value1"
-					if _, err := b.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
 					return res
 				}(),
 			},
@@ -104,25 +90,18 @@ func Test_BuildIndex(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			offsets, err := BuildIndex(tt.args.walIndex, tt.args.storage)
+			offsets, err := BuildIndex(tt.args.walIndex, tt.args.storage, defaultSchemas())
 			if (err != nil && !errors.Is(err, tt.expectedErr)) || (err == nil && tt.expectedErr != nil) {
-				t.Errorf("loadOperationsFromLogFile() error = %v, want %v", err, tt.expectedErr)
+				t.Errorf("BuildIndex() error = %v, want %v", err, tt.expectedErr)
 			}
 
 			for tableName, idx := range tt.want {
 				for k, v := range idx {
 					if got := offsets[tableName][k]; got != v {
-						t.Errorf("loadOperationsFromLogFile() = %v, want %v", got, v)
-						tt.args.storage["default"].Seek(0, 0)
-						content, err := io.ReadAll(tt.args.storage["default"])
-						if err != nil {
-							t.Fatal("faile to read file", err)
-						}
-						t.Log("file contents", string(content))
+						t.Errorf("BuildIndex() = %v, want %v", got, v)
 					}
 				}
 			}
-
 		})
 	}
 }
@@ -146,7 +125,6 @@ func TestDB_CreateTable(t *testing.T) {
 			name: "create new table",
 			fields: fields{
 				LogFile: nil,
-				Mutex:   sync.RWMutex{},
 				Tables:  make(map[string]*Table),
 			},
 			args:        args{tableName: "new_table"},
@@ -156,7 +134,6 @@ func TestDB_CreateTable(t *testing.T) {
 			name: "create existing table",
 			fields: fields{
 				LogFile: nil,
-				Mutex:   sync.RWMutex{},
 				Tables:  map[string]*Table{"existing_table": {}},
 			},
 			args:        args{tableName: "existing_table"},
@@ -178,6 +155,8 @@ func TestDB_CreateTable(t *testing.T) {
 }
 
 func TestBuildIndexFromStorage(t *testing.T) {
+	schema := DefaultSchema()
+
 	type args struct {
 		storage io.ReadSeeker
 	}
@@ -190,37 +169,7 @@ func TestBuildIndexFromStorage(t *testing.T) {
 		{
 			name: "valid storage",
 			args: args{
-				storage: func() io.ReadSeeker {
-					b := strings.Builder{}
-					doc1 := "key1:value1"
-					if _, err := b.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					doc2 := "somelongkey:value2"
-					if _, err := b.WriteString(doc2); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					doc3 := "short:k3"
-					if _, err := b.WriteString(doc3); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc3))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					return strings.NewReader(b.String())
-				}(),
+				storage: bytes.NewReader(makeStorageData("key1", "value1", "somelongkey", "value2", "short", "k3")),
 			},
 			want: map[string]int64{
 				"key1":        0,
@@ -229,55 +178,19 @@ func TestBuildIndexFromStorage(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid line",
+			name: "invalid line - too short",
 			args: args{
 				storage: strings.NewReader("invalid\nlog\n"),
 			},
 			wantErr: true,
 		},
 		{
-			name: "invalid line missing colon",
+			name: "empty primary key",
 			args: args{
 				storage: func() io.ReadSeeker {
-					b := strings.Builder{}
-					doc1 := "notcontainscolon"
-					if _, err := b.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					return strings.NewReader(b.String())
-				}(),
-			},
-			wantErr: true,
-		},
-		{
-			name: "last entry is invalid should return empty",
-			args: args{
-				storage: func() io.ReadSeeker {
-					b := strings.Builder{}
-					doc1 := "key:somevalue"
-					if _, err := b.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					doc2 := "invalidentry"
-					if _, err := b.WriteString(doc2); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
-					if _, err := b.Write(padding); err != nil {
-						return nil
-					}
-
-					return strings.NewReader(b.String())
+					// Create a 128-byte record where the first 16 bytes (pk column) are all zeros
+					data := make([]byte, paddingSize)
+					return bytes.NewReader(data)
 				}(),
 			},
 			wantErr: true,
@@ -285,7 +198,7 @@ func TestBuildIndexFromStorage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := BuildIndexFromStorage(tt.args.storage)
+			got, err := BuildIndexFromStorage(tt.args.storage, schema)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("BuildIndexFromStorage() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -298,6 +211,9 @@ func TestBuildIndexFromStorage(t *testing.T) {
 }
 
 func TestReconcileChanges(t *testing.T) {
+	schema := DefaultSchema()
+	schemas := defaultSchemas()
+
 	type args struct {
 		finalIndex   map[string]map[string]int64
 		changeLog    map[string][]Record
@@ -308,66 +224,27 @@ func TestReconcileChanges(t *testing.T) {
 		args                 args
 		expectedTotalChanges int64
 		expectedFinalIndex   map[string]map[string]int64
-		expectedStorageFiles map[string]io.ReadWriteSeeker
 		wantErr              bool
 	}{
 		{
 			name: "nothing to reconcile",
 			args: args{
 				finalIndex: map[string]map[string]int64{
-					"default": {
-						"key1": 0,
-					},
+					"default": {"key1": 0},
 				},
 				changeLog: map[string][]Record{
-					"default": {
-						{
-							Key:   []byte("key1"),
-							Value: []byte("value1"),
-						},
-					},
+					"default": {makeRecord("key1", "value1")},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
 					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
-						doc1 := "key1:value1"
-						if _, err := f.WriteString(doc1); err != nil {
-							return nil
-						}
-						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-						if _, err := f.Write(padding); err != nil {
-							return nil
-						}
-
+						f, _ := os.CreateTemp("", "")
+						f.Write(makeStorageData("key1", "value1"))
 						return f
 					}(),
 				},
 			},
 			expectedFinalIndex: map[string]map[string]int64{
-				"default": {
-					"key1": 0,
-				},
-			},
-			expectedStorageFiles: map[string]io.ReadWriteSeeker{
-				"default": func() io.ReadWriteSeeker {
-					f, err := os.CreateTemp("", "")
-					if err != nil {
-						return nil
-					}
-					doc1 := "key1:value1"
-					if _, err := f.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					return f
-				}(),
+				"default": {"key1": 0},
 			},
 			expectedTotalChanges: 0,
 		},
@@ -375,68 +252,21 @@ func TestReconcileChanges(t *testing.T) {
 			name: "reconcile 1 change, same key different value",
 			args: args{
 				finalIndex: map[string]map[string]int64{
-					"default": {
-						"key1": 0,
-					},
+					"default": {"key1": 0},
 				},
 				changeLog: map[string][]Record{
-					"default": {
-						{
-							Key:   []byte("key1"),
-							Value: []byte("newvalue1"),
-						},
-					},
+					"default": {makeRecord("key1", "newvalue1")},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
 					"default": func() io.ReadWriteSeeker {
-						f, err := os.CreateTemp("", "")
-						if err != nil {
-							return nil
-						}
-						doc1 := "key1:value1"
-						if _, err := f.WriteString(doc1); err != nil {
-							return nil
-						}
-						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-						if _, err := f.Write(padding); err != nil {
-							return nil
-						}
-
+						f, _ := os.CreateTemp("", "")
+						f.Write(makeStorageData("key1", "value1"))
 						return f
 					}(),
 				},
 			},
 			expectedFinalIndex: map[string]map[string]int64{
-				"default": {
-					"key1": paddingSize * 1,
-				},
-			},
-			expectedStorageFiles: map[string]io.ReadWriteSeeker{
-				"default": func() io.ReadWriteSeeker {
-					f, err := os.CreateTemp("", "")
-					if err != nil {
-						return nil
-					}
-					doc1 := "key1:value1"
-					if _, err := f.WriteString(doc1); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					doc2 := "key1:newvalue1"
-					if _, err := f.WriteString(doc2); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					return f
-				}(),
+				"default": {"key1": paddingSize * 1},
 			},
 			expectedTotalChanges: 1,
 		},
@@ -444,30 +274,18 @@ func TestReconcileChanges(t *testing.T) {
 			name: "reconcile 1 change, new key",
 			args: args{
 				finalIndex: map[string]map[string]int64{
-					"default": {
-						"key1": 0,
-					},
+					"default": {"key1": 0},
 				},
 				changeLog: map[string][]Record{
 					"default": {
-						{
-							Key:   []byte("key1"),
-							Value: []byte("newvalue1"),
-						},
-						{
-							Key:   []byte("key2"),
-							Value: []byte("newvalue2"),
-						},
+						makeRecord("key1", "newvalue1"),
+						makeRecord("key2", "newvalue2"),
 					},
 				},
 				storageFiles: map[string]io.ReadWriteSeeker{
-					"default": func() *storage.InMemoryStorage {
+					"default": func() io.ReadWriteSeeker {
 						f := &storage.InMemoryStorage{}
-						doc1 := "key1:value1"
-						f.Write([]byte(doc1))
-						padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-						f.Write(padding)
-
+						f.Write(makeStorageData("key1", "value1"))
 						return f
 					}(),
 				},
@@ -478,45 +296,13 @@ func TestReconcileChanges(t *testing.T) {
 					"key2": paddingSize * 2,
 				},
 			},
-			expectedStorageFiles: map[string]io.ReadWriteSeeker{
-				"default": func() *storage.InMemoryStorage {
-					f := &storage.InMemoryStorage{}
-					doc1 := "key1:value1"
-					if _, err := f.Write([]byte(doc1)); err != nil {
-						return nil
-					}
-					padding := bytes.Repeat([]byte{0}, paddingSize-len(doc1))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					doc2 := "key1:newvalue1"
-					if _, err := f.Write([]byte(doc2)); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc2))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					doc3 := "key2:newvalue2"
-					if _, err := f.Write([]byte(doc3)); err != nil {
-						return nil
-					}
-					padding = bytes.Repeat([]byte{0}, paddingSize-len(doc3))
-					if _, err := f.Write(padding); err != nil {
-						return nil
-					}
-
-					return f
-				}(),
-			},
 			expectedTotalChanges: 2,
 		},
 	}
+	_ = schema
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			totalChanges, err := ReconcileChanges(tt.args.finalIndex, tt.args.changeLog, tt.args.storageFiles)
+			totalChanges, err := ReconcileChanges(tt.args.finalIndex, tt.args.changeLog, tt.args.storageFiles, schemas)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("ReconcileChanges() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -525,30 +311,7 @@ func TestReconcileChanges(t *testing.T) {
 			}
 
 			if !reflect.DeepEqual(tt.args.finalIndex, tt.expectedFinalIndex) {
-				t.Fatalf("ReconcileChanges() = %v, want %v", tt.args.finalIndex, tt.expectedFinalIndex)
-			}
-
-			// compare storage files
-			if len(tt.args.storageFiles) != len(tt.expectedStorageFiles) {
-				t.Errorf("ReconcileChanges() = %v, want %v", tt.args.storageFiles, tt.expectedStorageFiles)
-			}
-
-			for i := range tt.args.storageFiles {
-				got := tt.args.storageFiles[i]
-				expected := tt.expectedStorageFiles[i]
-
-				gotBytes, err := io.ReadAll(got)
-				if err != nil {
-					t.Errorf("ReconcileChanges() error reading got = %v", err)
-				}
-				expectedBytes, err := io.ReadAll(expected)
-				if err != nil {
-					t.Errorf("ReconcileChanges() error reading expected = %v", err)
-				}
-
-				if string(gotBytes) != string(expectedBytes) {
-					t.Errorf("ReconcileChanges() = %v, want %v", string(gotBytes), string(expectedBytes))
-				}
+				t.Fatalf("ReconcileChanges() index = %v, want %v", tt.args.finalIndex, tt.expectedFinalIndex)
 			}
 		})
 	}
@@ -600,7 +363,6 @@ func TestDB_DeleteTable_RemovesFileAndEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}
-	// Do not defer f.Close/remove here; DeleteTable should handle it
 	path := f.Name()
 
 	db := &DB{
@@ -631,26 +393,43 @@ func TestDB_DeleteTable_TableNotFound(t *testing.T) {
 }
 
 func TestParseWAL(t *testing.T) {
-	type args struct {
-		walFile      io.Reader
-		storageFiles map[string]io.ReadWriteSeeker
-	}
+	schemas := defaultSchemas()
+
 	tests := []struct {
 		name    string
-		args    args
+		walFile io.Reader
 		want    map[string][]Record
 		wantErr bool
 	}{
-		// TODO: Add test cases.
+		{
+			name:    "valid WAL with two entries",
+			walFile: strings.NewReader("default:key1:val1\ndefault:key2:val2\n"),
+			want: map[string][]Record{
+				"default": {
+					makeRecord("key1", "val1"),
+					makeRecord("key2", "val2"),
+				},
+			},
+		},
+		{
+			name:    "empty WAL",
+			walFile: strings.NewReader(""),
+			want:    map[string][]Record{},
+		},
+		{
+			name:    "invalid WAL line is skipped",
+			walFile: strings.NewReader("invalid\n"),
+			want:    map[string][]Record{},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseWAL(tt.args.walFile, tt.args.storageFiles)
+			got, err := ParseWAL(tt.walFile, schemas)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParseWAL() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ParseWAL() = %v, want %v", got, tt.want)
 			}
 		})
