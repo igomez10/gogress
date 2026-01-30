@@ -540,6 +540,145 @@ func TestDB_DeleteTable_TableNotFound(t *testing.T) {
 	}
 }
 
+func TestTableLifecycle(t *testing.T) {
+	// Setup: DB with default + internal_schemas tables
+	isTbl := &Table{
+		KeyOffsets: make(map[string]int64),
+		Storage:    &MockReadWriteCloserSeeker{},
+		Schema:     InternalSchemasSchema(),
+	}
+	db := &DB{
+		LogFile: &bytes.Buffer{},
+		Tables: map[string]*Table{
+			"default":          {KeyOffsets: make(map[string]int64), Storage: &MockReadWriteCloserSeeker{}, Schema: DefaultSchema()},
+			"internal_schemas": isTbl,
+		},
+	}
+
+	// Step 2: Create table with real temp file so delete path is exercised
+	coursesFile, err := os.CreateTemp("", "courses-*")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	coursesPath := coursesFile.Name()
+
+	schema := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnTypeString, Width: 32},
+		{Name: "name", Type: ColumnTypeString, Width: 32},
+		{Name: "grade", Type: ColumnTypeInt, Width: 8},
+	}}
+	if err := db.CreateTable("courses", &CreateTableOptions{Storage: coursesFile, Schema: schema}); err != nil {
+		t.Fatalf("CreateTable() error = %v", err)
+	}
+
+	tables := db.ListTables()
+	found := false
+	for _, name := range tables {
+		if name == "courses" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("courses not found in ListTables()")
+	}
+
+	// Step 3: Scan empty table
+	records, err := db.Scan("courses", ScanOptions{})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 records, got %d", len(records))
+	}
+
+	// Step 4: Get missing key
+	_, gFound, err := db.Get("courses", []byte("1"))
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if gFound {
+		t.Fatalf("expected found=false for missing key")
+	}
+
+	// Step 5: Insert
+	if err := db.Put("courses", map[string][]byte{
+		"id": []byte("1"), "name": []byte("math"), "grade": []byte("90"),
+	}); err != nil {
+		t.Fatalf("Put() error = %v", err)
+	}
+
+	// Step 6: Get existing key
+	rec, gFound, err := db.Get("courses", []byte("1"))
+	if err != nil || !gFound {
+		t.Fatalf("Get() error=%v found=%v", err, gFound)
+	}
+	if string(rec.Columns["name"]) != "math" {
+		t.Errorf("expected name=math, got %q", rec.Columns["name"])
+	}
+	if string(rec.Columns["grade"]) != "90" {
+		t.Errorf("expected grade=90, got %q", rec.Columns["grade"])
+	}
+
+	// Step 7: Scan after insert
+	records, err = db.Scan("courses", ScanOptions{})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	// Step 8: Update (same key, new grade)
+	if err := db.Put("courses", map[string][]byte{
+		"id": []byte("1"), "name": []byte("math"), "grade": []byte("95"),
+	}); err != nil {
+		t.Fatalf("Put() error = %v", err)
+	}
+
+	// Step 9: Get after update
+	rec, gFound, err = db.Get("courses", []byte("1"))
+	if err != nil || !gFound {
+		t.Fatalf("Get() error=%v found=%v", err, gFound)
+	}
+	if string(rec.Columns["grade"]) != "95" {
+		t.Errorf("expected grade=95, got %q", rec.Columns["grade"])
+	}
+
+	// Step 10: Scan after update — still 1 record
+	records, err = db.Scan("courses", ScanOptions{})
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record after update, got %d", len(records))
+	}
+	if string(records[0].Columns["grade"]) != "95" {
+		t.Errorf("expected updated grade=95 in scan, got %q", records[0].Columns["grade"])
+	}
+
+	// Step 11: Delete table
+	if err := db.DeleteTable("courses"); err != nil {
+		t.Fatalf("DeleteTable() error = %v", err)
+	}
+
+	// Step 12: Verify table gone from ListTables
+	for _, name := range db.ListTables() {
+		if name == "courses" {
+			t.Fatalf("courses should not appear in ListTables after delete")
+		}
+	}
+
+	// Step 13: Verify storage file removed
+	if _, err := os.Stat(coursesPath); !os.IsNotExist(err) {
+		t.Fatalf("expected storage file to be removed, got err = %v", err)
+	}
+
+	// Step 14: Verify schema removed from internal_schemas
+	if _, ok := isTbl.KeyOffsets["courses"]; ok {
+		t.Fatalf("schema record for courses should be removed after delete")
+	}
+}
+
 func TestParseWAL(t *testing.T) {
 	schemas := defaultSchemas()
 
